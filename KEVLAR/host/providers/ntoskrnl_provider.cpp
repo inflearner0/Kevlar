@@ -195,6 +195,7 @@ void ntoskrnl_provider::Initialize() {
     Provider::AddFuncImpl("MmGetPhysicalMemoryRanges", h_MmGetPhysicalMemoryRanges);
     Provider::AddFuncImpl("MmGetPhysicalAddress", h_MmGetPhysicalAddress);
     Provider::AddFuncImpl("_vsnwprintf", h__vsnwprintf);
+    Provider::AddFuncImpl("_vsnprintf", h__vsnprintf);
     Provider::AddFuncImpl("ZwOpenSection", h_ZwOpenSection);
     Provider::AddFuncImpl("MmGetSystemRoutineAddress", h_MmGetSystemRoutineAddress);
     Provider::AddFuncImpl("IoDeleteSymbolicLink", h_IoDeleteSymbolicLink);

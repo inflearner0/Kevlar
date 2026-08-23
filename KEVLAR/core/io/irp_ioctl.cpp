@@ -11,7 +11,8 @@ static IoManager::DispatchResult DispatchDeviceIoControlSeh(
     ULONG IoControlCode,
     void* InputBuffer, ULONG InputLength,
     void* OutputBuffer, ULONG OutputLength,
-    ULONG* BytesReturned)
+    ULONG* BytesReturned,
+    CHAR RequestorMode)
 {
     IoManager::DispatchResult Result = {};
     Result.Status = KEVLAR_STATUS_INTERNAL_ERROR;
@@ -134,7 +135,7 @@ static IoManager::DispatchResult DispatchDeviceIoControlSeh(
     IoSlHost->DeviceObject = (_DEVICE_OBJECT*)DeviceObjUcAddr;
     IoSlHost->FileObject = (_FILE_OBJECT*)FileObjUcAddr;
 
-    IrpHost->RequestorMode = 1;
+    IrpHost->RequestorMode = RequestorMode;
     IrpHost->CurrentLocation = 1;
     IrpHost->Tail.Overlay.CurrentStackLocation = (_IO_STACK_LOCATION*)IoSlUcAddr;
 
@@ -230,11 +231,12 @@ IoManager::DispatchResult IoManager::DispatchDeviceIoControl(
     ULONG IoControlCode,
     void* InputBuffer, ULONG InputLength,
     void* OutputBuffer, ULONG OutputLength,
-    ULONG* BytesReturned)
+    ULONG* BytesReturned,
+    CHAR RequestorMode)
 {
     __try {
         return DispatchDeviceIoControlSeh(DeviceObjUcAddr, FileObjUcAddr,
-            IoControlCode, InputBuffer, InputLength, OutputBuffer, OutputLength, BytesReturned);
+            IoControlCode, InputBuffer, InputLength, OutputBuffer, OutputLength, BytesReturned, RequestorMode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("{RED}IoManager::DispatchIoctl IOCTL=0x%08x: exception 0x%08x{RESET}\n",
             IoControlCode, GetExceptionCode());

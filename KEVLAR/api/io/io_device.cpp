@@ -4,8 +4,6 @@
 #include "core/process/unicorn_threading.h"
 #include "core/io/io_manager.h"
 
-NTSTATUS h_ZwClose(HANDLE Handle);
-
 namespace DeviceTracker {
     std::vector<DeviceInfo> Devices;
     std::mutex DeviceLock;
@@ -140,34 +138,29 @@ void h_IoDeleteController(PVOID ControllerObject) {
 }
 
 NTSTATUS h_IoDeleteSymbolicLink(PUNICODE_STRING SymbolicLinkName) {
-
-    int TemporaryObject;
-    OBJECT_ATTRIBUTES ObjectAttributes;
-    HANDLE LinkHandle;
-
     auto HostSymName = UcPtr(SymbolicLinkName);
-    UNICODE_STRING LocalSymName = *HostSymName;
-    LocalSymName.Buffer = UcPtr(LocalSymName.Buffer);
+    auto HostSymBuf = UcPtr(HostSymName->Buffer);
+    std::wstring SymStr(HostSymBuf, HostSymName->Length / sizeof(wchar_t));
 
-    Logger::Log("{CYN}\tIoDeleteSymbolicLink: %ls{RESET}\n", LocalSymName.Buffer);
+    Logger::Log("{CYN}\tIoDeleteSymbolicLink: %ls{RESET}\n", SymStr.c_str());
 
-    memset(&ObjectAttributes.Attributes + 1, 0, 20);
-    LinkHandle = 0;
-    ObjectAttributes.RootDirectory = 0;
-    ObjectAttributes.ObjectName = &LocalSymName;
-    *(uintptr_t*)&ObjectAttributes.Length = 48;
-    ObjectAttributes.Attributes = 576;
-    TemporaryObject = __NtRoutine("ZwOpenSymbolicLinkObject", &LinkHandle, 0x10000u, &ObjectAttributes);
-    if (TemporaryObject >= 0) {
-        TemporaryObject = __NtRoutine("ZwMakeTemporaryObject", LinkHandle);
-        if (TemporaryObject >= 0)
-            h_ZwClose(&LinkHandle);
+    // Mirrors h_IoCreateSymbolicLink: symlinks live only in DeviceTracker's emulated
+    // state, so deletion must stay there too. This used to call the real
+    // ZwOpenSymbolicLinkObject/ZwMakeTemporaryObject against the host Object Manager,
+    // which meant a guest driver deleting a symlink name that happens to exist on the
+    // host would make the host's real object temporary (kevlar_proxy/README.md SS8).
+    {
+        std::lock_guard<std::mutex> Guard(DeviceTracker::DeviceLock);
+        for (auto& Dev : DeviceTracker::Devices) {
+            if (Dev.SymLinkName == SymStr) {
+                Dev.SymLinkName.clear();
+                Logger::Log("{CYN}\tUnlinked symlink {WHT}%ls{RESET}\n", SymStr.c_str());
+                break;
+            }
+        }
     }
 
-    if (TemporaryObject == (int)0xC0000034)
-        TemporaryObject = 0;
-
-    return TemporaryObject;
+    return 0; // STATUS_SUCCESS
 }
 
 //todo impl

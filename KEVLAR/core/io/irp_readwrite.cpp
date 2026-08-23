@@ -9,7 +9,8 @@
 static IoManager::DispatchResult DispatchWriteSeh(
     uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr,
     void* WriteBuffer, ULONG WriteLength,
-    ULONG WriteOffset, ULONG* BytesWritten)
+    ULONG WriteOffset, ULONG* BytesWritten,
+    CHAR RequestorMode)
 {
     IoManager::DispatchResult Result = {};
     Result.Status = KEVLAR_STATUS_INTERNAL_ERROR;
@@ -83,7 +84,7 @@ static IoManager::DispatchResult DispatchWriteSeh(
     IoSlHost->DeviceObject = (_DEVICE_OBJECT*)DeviceObjUcAddr;
     IoSlHost->FileObject = (_FILE_OBJECT*)FileObjUcAddr;
 
-    IrpHost->RequestorMode = 1;
+    IrpHost->RequestorMode = RequestorMode;
     IrpHost->CurrentLocation = 1;
     IrpHost->Tail.Overlay.CurrentStackLocation = (_IO_STACK_LOCATION*)IoSlUcAddr;
 
@@ -159,11 +160,12 @@ static IoManager::DispatchResult DispatchWriteSeh(
 IoManager::DispatchResult IoManager::DispatchWrite(
     uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr,
     void* WriteBuffer, ULONG WriteLength,
-    ULONG WriteOffset, ULONG* BytesWritten)
+    ULONG WriteOffset, ULONG* BytesWritten,
+    CHAR RequestorMode)
 {
     __try {
         return DispatchWriteSeh(DeviceObjUcAddr, FileObjUcAddr,
-            WriteBuffer, WriteLength, WriteOffset, BytesWritten);
+            WriteBuffer, WriteLength, WriteOffset, BytesWritten, RequestorMode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("{RED}IoManager::DispatchWrite: exception 0x%08x{RESET}\n", GetExceptionCode());
         DispatchResult Result = {};
@@ -177,7 +179,8 @@ IoManager::DispatchResult IoManager::DispatchWrite(
 static IoManager::DispatchResult DispatchReadSeh(
     uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr,
     void* ReadBuffer, ULONG ReadLength,
-    ULONG ReadOffset, ULONG* BytesRead)
+    ULONG ReadOffset, ULONG* BytesRead,
+    CHAR RequestorMode)
 {
     IoManager::DispatchResult Result = {};
     Result.Status = KEVLAR_STATUS_INTERNAL_ERROR;
@@ -250,7 +253,7 @@ static IoManager::DispatchResult DispatchReadSeh(
     IoSlHost->DeviceObject = (_DEVICE_OBJECT*)DeviceObjUcAddr;
     IoSlHost->FileObject = (_FILE_OBJECT*)FileObjUcAddr;
 
-    IrpHost->RequestorMode = 1;
+    IrpHost->RequestorMode = RequestorMode;
     IrpHost->CurrentLocation = 1;
     IrpHost->Tail.Overlay.CurrentStackLocation = (_IO_STACK_LOCATION*)IoSlUcAddr;
 
@@ -332,11 +335,12 @@ static IoManager::DispatchResult DispatchReadSeh(
 IoManager::DispatchResult IoManager::DispatchRead(
     uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr,
     void* ReadBuffer, ULONG ReadLength,
-    ULONG ReadOffset, ULONG* BytesRead)
+    ULONG ReadOffset, ULONG* BytesRead,
+    CHAR RequestorMode)
 {
     __try {
         return DispatchReadSeh(DeviceObjUcAddr, FileObjUcAddr,
-            ReadBuffer, ReadLength, ReadOffset, BytesRead);
+            ReadBuffer, ReadLength, ReadOffset, BytesRead, RequestorMode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("{RED}IoManager::DispatchRead: exception 0x%08x{RESET}\n", GetExceptionCode());
         DispatchResult Result = {};

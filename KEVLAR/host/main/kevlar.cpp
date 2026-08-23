@@ -32,9 +32,14 @@
 #include "api/ke/ke_sync.h"
 #include "api/ke/ke_timer.h"
 #include "api/ke/ke_event.h"
+#include "host/bridge/bridge_server.h"
+#include "host/bridge/proxy_relay.h"
 
 static bool NoPause = false;
 static bool SelfTest = false;
+static bool ServeRequested = false;
+static std::string ServeName;
+static bool ProxyRequested = false;
 
 // Host-level selftest for the ke_* semantics: exercises IRQL, APC queue/delivery,
 // DPC queue and timer cancel/periodic directly against the built environment.
@@ -235,6 +240,8 @@ int main(int Argc, char* Argv[]) {
         Logger::Log("  --check <file>          Replay trace; report first divergence{RESET}\n");
         Logger::Log("  --no-pause              Skip final pause; exit ~5s after a no-thread run (automation){RESET}\n");
         Logger::Log("  --selftest              Run the ke_* semantics self-test and exit (no driver){RESET}\n");
+        Logger::Log("  --serve[=name]          Serve IOCTL/Read/Write over \\\\.\\pipe\\kevlar-<name> (default: driver service name){RESET}\n");
+        Logger::Log("  --proxy                 Relay real CreateFile/DeviceIoControl via kevlarproxy.sys (needs it loaded){RESET}\n");
     };
 
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
@@ -329,6 +336,15 @@ int main(int Argc, char* Argv[]) {
                 NoPause = true;
             } else if (Arg == "--selftest") {
                 SelfTest = true;
+            } else if (Arg.rfind("--serve", 0) == 0) {
+                ServeRequested = true;
+                if (Arg.size() > 7 && Arg[7] == '=')
+                    ServeName = Arg.substr(8);
+                Logger::Log("{CYN}Usermode bridge server requested%s{RESET}\n",
+                    ServeName.empty() ? " (name: driver service name)" : (" (name: " + ServeName + ")").c_str());
+            } else if (Arg == "--proxy") {
+                ProxyRequested = true;
+                Logger::Log("{CYN}Kernel proxy relay requested (kevlarproxy.sys via \\\\.\\KevlarProxyCtl){RESET}\n");
             } else if (Arg == "--pause")
             {
                system("pause");
@@ -397,6 +413,9 @@ int main(int Argc, char* Argv[]) {
         auto Dot = SvcName.find_last_of('.');
         if (Dot != std::string::npos)
             SvcName = SvcName.substr(0, Dot);
+
+        if (ServeRequested && ServeName.empty())
+            ServeName = SvcName;
 
         static std::wstring WDriverName;
         static std::wstring WRegistryBuffer;
@@ -564,6 +583,21 @@ int main(int Argc, char* Argv[]) {
     else
         Logger::Log("{RED}DriverEntry failed or was stopped{RESET}\n");
 
+    if (ServeRequested) {
+        if (BridgeServer::Start(ServeName))
+            Logger::Log("{GRN}Usermode bridge listening on \\\\.\\pipe\\kevlar-%s ({WHT}%zu{GRN} device(s) registered){RESET}\n",
+                ServeName.c_str(), DeviceTracker::GetCount());
+        else
+            Logger::Log("{RED}Usermode bridge failed to start{RESET}\n");
+    }
+
+    if (ProxyRequested) {
+        if (ProxyRelay::Start())
+            Logger::Log("{GRN}Kernel proxy relay active via \\\\.\\KevlarProxyCtl{RESET}\n");
+        else
+            Logger::Log("{RED}Kernel proxy relay failed to start (see above){RESET}\n");
+    }
+
     Logger::Log("{MAG}Waiting for spawned threads (will keep alive up to 3600s for deferred work)...{RESET}\n");
 
     {
@@ -608,7 +642,7 @@ int main(int Argc, char* Argv[]) {
                     EverHadThreads ? "" : " (waiting for first thread)");
             }
 
-            if (EverHadThreads && !AnyRunning) {
+            if (EverHadThreads && !AnyRunning && !ServeRequested && !ProxyRequested) {
                 IdleCycles++;
                 if (IdleCycles > 50) {
                     Logger::Log("{CYN}All spawned threads finished after %.1fs{RESET}\n", Elapsed);
@@ -616,10 +650,14 @@ int main(int Argc, char* Argv[]) {
                 }
             }
 
-            double NoThreadTimeout = NoPause ? 5.0 : MaxWaitSeconds;
-            if (!EverHadThreads && Elapsed >= NoThreadTimeout) {
-                Logger::Log("{YEL}No threads spawned after %.0fs — giving up{RESET}\n", Elapsed);
-                break;
+            // Under --serve/--proxy, the process exists to answer relayed requests, so
+            // idle guest threads and a driver that never spawned one are not exit conditions.
+            if (!ServeRequested && !ProxyRequested) {
+                double NoThreadTimeout = NoPause ? 5.0 : MaxWaitSeconds;
+                if (!EverHadThreads && Elapsed >= NoThreadTimeout) {
+                    Logger::Log("{YEL}No threads spawned after %.0fs — giving up{RESET}\n", Elapsed);
+                    break;
+                }
             }
 
             Sleep(100);
@@ -629,6 +667,11 @@ int main(int Argc, char* Argv[]) {
     Logger::Log("{GRN}Done. Press any key to exit.{RESET}\n");
     if (!NoPause)
         system("pause");
+
+    if (ServeRequested)
+        BridgeServer::Stop();
+    if (ProxyRequested)
+        ProxyRelay::Stop();
 
     UnicornEmu::Shutdown();
     Logger::MarkThreadEnd("main");

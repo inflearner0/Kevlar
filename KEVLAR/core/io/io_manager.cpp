@@ -9,6 +9,10 @@
 std::unordered_map<uint64_t, IoManager::IrpCompletionInfo> CompletionMap;
 std::mutex CompletionLock;
 
+namespace IoManager {
+std::mutex DispatchMutex;
+}
+
 void IoManager::Initialize() {
     std::lock_guard<std::mutex> Guard(CompletionLock);
     CompletionMap.clear();
@@ -133,7 +137,7 @@ bool CompletionMapRead(uint64_t IrpUcAddr, NTSTATUS* OutStatus, ULONG_PTR* OutIn
     return false;
 }
 
-static IoManager::DispatchResult DispatchSimpleIrpSeh(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, UCHAR MajorFunction) {
+static IoManager::DispatchResult DispatchSimpleIrpSeh(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, UCHAR MajorFunction, CHAR RequestorMode) {
     IoManager::DispatchResult Result = {};
     Result.Status = KEVLAR_STATUS_INTERNAL_ERROR;
     Result.Information = 0;
@@ -181,7 +185,7 @@ static IoManager::DispatchResult DispatchSimpleIrpSeh(uint64_t DeviceObjUcAddr, 
     IoSlHost->DeviceObject = (_DEVICE_OBJECT*)DeviceObjUcAddr;
     IoSlHost->FileObject = (_FILE_OBJECT*)FileObjUcAddr;
 
-    IrpHost->RequestorMode = 1;
+    IrpHost->RequestorMode = RequestorMode;
     IrpHost->CurrentLocation = 1;
     IrpHost->Tail.Overlay.CurrentStackLocation = (_IO_STACK_LOCATION*)IoSlUcAddr;
 
@@ -254,9 +258,9 @@ static IoManager::DispatchResult DispatchSimpleIrpSeh(uint64_t DeviceObjUcAddr, 
     return Result;
 }
 
-static IoManager::DispatchResult DispatchSimpleIrp(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, UCHAR MajorFunction) {
+static IoManager::DispatchResult DispatchSimpleIrp(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, UCHAR MajorFunction, CHAR RequestorMode) {
     __try {
-        return DispatchSimpleIrpSeh(DeviceObjUcAddr, FileObjUcAddr, MajorFunction);
+        return DispatchSimpleIrpSeh(DeviceObjUcAddr, FileObjUcAddr, MajorFunction, RequestorMode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("{RED}IoManager::DispatchSimple MJ=0x%02x: exception 0x%08x{RESET}\n",
             MajorFunction, GetExceptionCode());
@@ -266,14 +270,14 @@ static IoManager::DispatchResult DispatchSimpleIrp(uint64_t DeviceObjUcAddr, uin
     }
 }
 
-IoManager::DispatchResult IoManager::DispatchCreate(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr) {
-    return DispatchSimpleIrp(DeviceObjUcAddr, FileObjUcAddr, 0x00);
+IoManager::DispatchResult IoManager::DispatchCreate(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, CHAR RequestorMode) {
+    return DispatchSimpleIrp(DeviceObjUcAddr, FileObjUcAddr, 0x00, RequestorMode);
 }
 
-IoManager::DispatchResult IoManager::DispatchClose(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr) {
-    return DispatchSimpleIrp(DeviceObjUcAddr, FileObjUcAddr, 0x02);
+IoManager::DispatchResult IoManager::DispatchClose(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, CHAR RequestorMode) {
+    return DispatchSimpleIrp(DeviceObjUcAddr, FileObjUcAddr, 0x02, RequestorMode);
 }
 
-IoManager::DispatchResult IoManager::DispatchCleanup(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr) {
-    return DispatchSimpleIrp(DeviceObjUcAddr, FileObjUcAddr, 0x12);
+IoManager::DispatchResult IoManager::DispatchCleanup(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, CHAR RequestorMode) {
+    return DispatchSimpleIrp(DeviceObjUcAddr, FileObjUcAddr, 0x12, RequestorMode);
 }

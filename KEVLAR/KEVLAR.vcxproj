@@ -130,7 +130,7 @@
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <BufferSecurityCheck>true</BufferSecurityCheck>
-      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;..\kevlar_proxy;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -164,7 +164,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <GuardEHContMetadata>false</GuardEHContMetadata>
       <StructMemberAlignment>16Bytes</StructMemberAlignment>
-      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;..\kevlar_proxy;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -234,6 +234,8 @@
     <ClCompile Include="api\rtl\crt_string.cpp" />
     <ClCompile Include="api\cng\cng.cpp" />
     <ClCompile Include="host\main\kevlar.cpp" />
+    <ClCompile Include="host\bridge\bridge_server.cpp" />
+    <ClCompile Include="host\bridge\proxy_relay.cpp" />
     <ClCompile Include="host\providers\provider.cpp" />
     <ClCompile Include="host\providers\ntoskrnl_provider.cpp" />
     <ClCompile Include="host\providers\static_export_provider.cpp" />
@@ -292,6 +294,10 @@
     <ClInclude Include="include\ntoskrnl_struct.h" />
     <ClInclude Include="include\utils.h" />
     <ClInclude Include="host\config\config.h" />
+    <ClInclude Include="host\bridge\bridge_protocol.h" />
+    <ClInclude Include="host\bridge\bridge_server.h" />
+    <ClInclude Include="host\bridge\proxy_relay.h" />
+    <ClInclude Include="..\kevlar_proxy\kvp_protocol.h" />
     <ClInclude Include="host\providers\provider.h" />
     <ClInclude Include="host\providers\ntoskrnl_provider.h" />
     <ClInclude Include="host\providers\static_export_provider.h" />

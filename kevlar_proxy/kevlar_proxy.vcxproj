@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6E6C0B1E-6E4B-4B2E-9C9A-2B2E6D6E6C1E}</ProjectGuid>
+    <TemplateGuid>e83a6bd0-70bb-4f3d-8a56-1a3517feb1b7</TemplateGuid>
+    <TargetVersion>Windows10</TargetVersion>
+    <MinimumVisualStudioVersion>15.0</MinimumVisualStudioVersion>
+    <Configuration>Debug</Configuration>
+    <Platform>x64</Platform>
+    <RootNamespace>kevlarproxy</RootNamespace>
+    <ProjectName>kevlarproxy</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup>
+    <TargetName>kevlarproxy</TargetName>
+    <OutDir>$(SolutionDir)builds\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)builds\obj\$(Configuration)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+  <!-- Test-sign with a local self-signed cert (kevlar_proxy/README.md SS4.6): the
+       VM this loads into must import the matching .cer into Root + TrustedPublisher
+       and boot with testsigning on. -->
+  <ItemDefinitionGroup>
+    <DriverSign>
+      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <PreprocessorDefinitions>_KVP_DRIVER_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <!-- Driver projects link with /NODEFAULTLIB, which also suppresses the
+           pragma comment(lib, "wdmsec.lib") in kevlarproxy.c; IoCreateDeviceSecure
+           needs it listed explicitly. -->
+      <AdditionalDependencies>wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="kevlarproxy.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="kvp_protocol.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

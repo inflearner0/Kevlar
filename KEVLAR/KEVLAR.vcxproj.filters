@@ -76,6 +76,9 @@
     <Filter Include="host\providers">
       <UniqueIdentifier>{c0000001-0000-0000-0000-000000000003}</UniqueIdentifier>
     </Filter>
+    <Filter Include="host\bridge">
+      <UniqueIdentifier>{c0000001-0000-0000-0000-000000000006}</UniqueIdentifier>
+    </Filter>
     <Filter Include="host\ipc">
       <UniqueIdentifier>{c0000001-0000-0000-0000-000000000004}</UniqueIdentifier>
     </Filter>
@@ -258,6 +261,12 @@
     <ClCompile Include="host\main\kevlar.cpp">
       <Filter>host\main</Filter>
     </ClCompile>
+    <ClCompile Include="host\bridge\bridge_server.cpp">
+      <Filter>host\bridge</Filter>
+    </ClCompile>
+    <ClCompile Include="host\bridge\proxy_relay.cpp">
+      <Filter>host\bridge</Filter>
+    </ClCompile>
     <ClCompile Include="host\providers\provider.cpp">
       <Filter>host\providers</Filter>
     </ClCompile>
@@ -421,6 +430,18 @@
     </ClInclude>
     <ClInclude Include="host\config\config.h">
       <Filter>host\config</Filter>
+    </ClInclude>
+    <ClInclude Include="host\bridge\bridge_protocol.h">
+      <Filter>host\bridge</Filter>
+    </ClInclude>
+    <ClInclude Include="host\bridge\bridge_server.h">
+      <Filter>host\bridge</Filter>
+    </ClInclude>
+    <ClInclude Include="host\bridge\proxy_relay.h">
+      <Filter>host\bridge</Filter>
+    </ClInclude>
+    <ClInclude Include="..\kevlar_proxy\kvp_protocol.h">
+      <Filter>host\bridge</Filter>
     </ClInclude>
     <ClInclude Include="host\providers\provider.h">
       <Filter>host\providers</Filter>

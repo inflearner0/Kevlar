@@ -165,6 +165,92 @@ int h__vsnwprintf(wchar_t* buffer, size_t count, const wchar_t* format, va_list 
     }
 }
 
+static int CountFmtArgsA(const char* Fmt) {
+    int Count = 0;
+    for (const char* P = Fmt; *P; P++) {
+        if (*P == '%') {
+            P++;
+            if (!*P) break;
+            if (*P == '%') continue;
+            while (*P && !isalpha((unsigned char)*P) && *P != '%') P++;
+            if (*P && *P != '%') Count++;
+            if (!*P) break;
+        }
+    }
+    return Count;
+}
+
+// %s/%S translation follows real printf semantics for a narrow (ANSI) format
+// string: %s defaults to char*, %S is the "other width" (wchar_t*) -- opposite of
+// CountFmtArgs/ConvertStringArgs above, which handle a *wide* format string.
+static void ConvertStringArgsA(const char* Fmt, uint64_t* Args, int ArgCount) {
+    int ArgIdx = 0;
+    for (const char* P = Fmt; *P && ArgIdx < ArgCount; P++) {
+        if (*P != '%') continue;
+        P++;
+        if (!*P) break;
+        if (*P == '%') continue;
+        while (*P && !isalpha((unsigned char)*P) && *P != '%') P++;
+        if (!*P || *P == '%') break;
+        char Spec = *P;
+        if (Spec == 's' || Spec == 'S') {
+            uint64_t StrUc = Args[ArgIdx];
+            if (StrUc) {
+                void* HostStr = UnicornMem::UcToHost(StrUc);
+                if (HostStr)
+                    Args[ArgIdx] = (uint64_t)HostStr;
+                else
+                    Args[ArgIdx] = (Spec == 's') ? (uint64_t)EmptyAStr : (uint64_t)EmptyWStr;
+            } else {
+                Args[ArgIdx] = (Spec == 's') ? (uint64_t)EmptyAStr : (uint64_t)EmptyWStr;
+            }
+        }
+        ArgIdx++;
+    }
+}
+
+// Was previously an unregistered import: Provider::FindFuncImpl fell back to
+// passing the raw ntdll._vsnprintf address through, which then dereferenced guest
+// (UC) pointers directly as if they were host pointers -- an access violation on
+// every call for any driver that uses %s/%p with real argument data (found via
+// ch79.sys's rootme_kernel_02 GET_REQUEST handler: 64+ HOOK CRASHes formatting a
+// hex-encoded hash, one per byte, leaving its output buffer permanently zeroed).
+int h__vsnprintf(char* buffer, size_t count, const char* format, va_list argptr) {
+    auto HostBuf = UcPtr(buffer);
+    auto HostFmt = UcPtr((char*)format);
+
+    if (!HostBuf || !HostFmt) {
+        Logger::Log("{RED}\t_vsnprintf: null buf=%p fmt=%p{RESET}\n", HostBuf, HostFmt);
+        return -1;
+    }
+
+    uint64_t UcArgPtr = (uint64_t)argptr;
+    auto HostArgBase = (uint64_t*)UnicornMem::UcToHost(UcArgPtr);
+
+    int FmtArgCount = CountFmtArgsA(HostFmt);
+
+    uint64_t ConvertedArgs[16] = { 0 };
+    if (HostArgBase) {
+        for (int I = 0; I < FmtArgCount && I < 16; I++)
+            ConvertedArgs[I] = HostArgBase[I];
+    }
+
+    ConvertStringArgsA(HostFmt, ConvertedArgs, FmtArgCount);
+
+    Logger::Log("{GRY}\t_vsnprintf fmt: %s (argc=%d){RESET}\n", HostFmt, FmtArgCount);
+
+    __try {
+        auto Ret = _vsnprintf(HostBuf, count, HostFmt, (va_list)ConvertedArgs);
+        if (HostBuf && count > 0)
+            Logger::Log("{GRY}\tResult : %s{RESET}\n", HostBuf);
+        return Ret;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("{RED}\t_vsnprintf CRASHED formatting '%s'{RESET}\n", HostFmt);
+        if (HostBuf && count > 0) HostBuf[0] = 0;
+        return -1;
+    }
+}
+
 int h__wcsnicmp(const wchar_t* Str1, const wchar_t* Str2, uint64_t Count) {
     auto Host1 = UcPtr((wchar_t*)Str1);
     auto Host2 = UcPtr((wchar_t*)Str2);
