@@ -692,7 +692,6 @@ namespace {
     // signature scan) walks its range, a spin keeps re-reading the same words.
     std::atomic<uint64_t> gReadMin[ReadBucketCount];
     std::atomic<uint64_t> gReadMax[ReadBucketCount];
-    std::atomic<uint64_t> gReadPages[ReadBucketCount];
 }
 
 static void TrackReadSpan(int Bucket, uint64_t Addr) {

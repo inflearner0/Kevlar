@@ -50,3 +50,7 @@ Thumbs.db
 
 # Local agent state
 .omc/
+
+# Local reverse-engineering scratch: IDA databases, driver copies, cleanup archives
+analysis/
+cleanup_archive_*/

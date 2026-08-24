@@ -132,6 +132,7 @@ Enable focused diagnostics:
 | `--devirt` | Enable devirtualization-testing behavior |
 | `--strict-exports` | Unhandled exports return `STATUS_NOT_IMPLEMENTED` instead of `0` |
 | `--provenance` | Trace branch decisions + API results for early rejection paths |
+| `--blockprof[=secs]` | Hot basic-block profiler: top blocks per interval, loads bucketed by region, guest registers and a VM-state fingerprint on the heartbeat (default dump every 30s) |
 | `--trace <file>` | Record a deterministic execution trace |
 | `--check <file>` | Replay a trace; report the first divergence |
 | `--no-pause` | Skip the final pause; exit ~5s after a no-thread run (automation) |
