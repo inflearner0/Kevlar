@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdio>
+#include <share.h>
 #include <string>
 #include <unordered_map>
 #include <filesystem>
@@ -107,7 +108,7 @@ static ThreadLogFile* GetOrCreateThreadLogLocked(DWORD Tid) {
 
     char ThreadPath[MAX_PATH] = {};
     snprintf(ThreadPath, sizeof(ThreadPath), "%s\\thread%u.txt", gPerThreadFolder.c_str(), Entry.Index);
-    fopen_s(&Entry.File, ThreadPath, "a");
+    Entry.File = _fsopen(ThreadPath, "a", _SH_DENYWR);
 
     if (Entry.File) {
         char Ts[64] = {};
@@ -162,7 +163,7 @@ bool Logger::InitFile(const char* Path) {
         fclose(hLogFile);
         hLogFile = nullptr;
     }
-    fopen_s(&hLogFile, Path, "a");
+    hLogFile = _fsopen(Path, "a", _SH_DENYWR);
     if (hLogFile) {
         SYSTEMTIME st;
         GetLocalTime(&st);
