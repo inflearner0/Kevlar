@@ -2,6 +2,7 @@
 #include "core/exec/unicorn_engine.h"
 #include <Logger/Logger.h>
 #include <malloc.h>
+#include <atomic>
 
 namespace UnicornMem {
     uint64_t NextPoolAddr = 0xFFFFB00000000000ULL;
@@ -11,6 +12,15 @@ namespace UnicornMem {
     std::unordered_map<uint64_t, uint64_t> PoolSizes;
     std::unordered_map<uint64_t, std::string> PoolNames;
     std::shared_mutex PoolLock;
+}
+
+// Bumped under PoolLock whenever a region is added or removed, so the per-thread
+// translation cache in UcToHost retires itself instead of handing out a pointer
+// into freed host memory.
+static std::atomic<uint64_t> gMapGeneration{ 1 };
+
+static void BumpMapGeneration() {
+    gMapGeneration.fetch_add(1, std::memory_order_release);
 }
 
 uint64_t UnicornMem::AllocatePool(uc_engine* Uc, uint64_t Size) {
@@ -42,6 +52,7 @@ uint64_t UnicornMem::AllocatePool(uc_engine* Uc, uint64_t Size) {
         }
     }
 
+    BumpMapGeneration();
     UcToHostMap[CurrentAddr] = HostBuf;
     HostToUcMap[HostBuf] = CurrentAddr;
     PoolSizes[CurrentAddr] = AlignedSize;
@@ -81,6 +92,7 @@ uint64_t UnicornMem::AllocatePoolWithTag(uc_engine* Uc, uint64_t Size, uint32_t 
         }
     }
 
+    BumpMapGeneration();
     UcToHostMap[CurrentAddr] = HostBuf;
     HostToUcMap[HostBuf] = CurrentAddr;
     PoolSizes[CurrentAddr] = AlignedSize;
@@ -107,6 +119,7 @@ void UnicornMem::FreePool(uc_engine* Uc, uint64_t UcAddr) {
     void* HostBuf = It->second;
 
     HostToUcMap.erase(HostBuf);
+    BumpMapGeneration();
     UcToHostMap.erase(It);
     PoolSizes.erase(UcAddr);
     PoolNames.erase(UcAddr);
@@ -147,6 +160,7 @@ uint64_t UnicornMem::AllocateVariable(uc_engine* Uc, uint64_t Size, const char* 
         }
     }
 
+    BumpMapGeneration();
     UcToHostMap[CurrentAddr] = HostBuf;
     HostToUcMap[HostBuf] = CurrentAddr;
     PoolSizes[CurrentAddr] = AlignedSize;
@@ -159,11 +173,34 @@ uint64_t UnicornMem::AllocateVariable(uc_engine* Uc, uint64_t Size, const char* 
 }
 
 void* UnicornMem::UcToHost(uint64_t UcAddr) {
+    // Code hooks call this for every guest instruction they see, and the lookup
+    // below is a locked linear scan of every tracked region - which grows as the
+    // driver allocates pool. Consecutive calls almost always land in the region
+    // resolved last, so keep that one per thread and retire it by generation.
+    static thread_local uint64_t CacheGen = 0;
+    static thread_local uint64_t CacheBase = 0;
+    static thread_local uint64_t CacheSize = 0;
+    static thread_local uint8_t* CacheHost = nullptr;
+
+    if (CacheSize && CacheGen == gMapGeneration.load(std::memory_order_acquire) &&
+        UcAddr >= CacheBase && (UcAddr - CacheBase) < CacheSize)
+        return CacheHost + (UcAddr - CacheBase);
+
     std::shared_lock<std::shared_mutex> Guard(PoolLock);
 
+    uint64_t Gen = gMapGeneration.load(std::memory_order_acquire);
+
     auto It = UcToHostMap.find(UcAddr);
-    if (It != UcToHostMap.end())
+    if (It != UcToHostMap.end()) {
+        auto ExactSize = PoolSizes.find(UcAddr);
+        if (ExactSize != PoolSizes.end() && ExactSize->second) {
+            CacheGen = Gen;
+            CacheBase = UcAddr;
+            CacheSize = ExactSize->second;
+            CacheHost = (uint8_t*)It->second;
+        }
         return It->second;
+    }
 
     for (auto& Entry : UcToHostMap) {
         uint64_t Base = Entry.first;
@@ -173,7 +210,13 @@ void* UnicornMem::UcToHost(uint64_t UcAddr) {
         uint64_t AllocSize = SizeIt->second;
         if (UcAddr >= Base && UcAddr < Base + AllocSize) {
             uint64_t Offset = UcAddr - Base;
-            return (uint8_t*)Entry.second + Offset;
+
+            CacheGen = Gen;
+            CacheBase = Base;
+            CacheSize = AllocSize;
+            CacheHost = (uint8_t*)Entry.second;
+
+            return CacheHost + Offset;
         }
     }
 
@@ -214,6 +257,7 @@ void UnicornMem::TrackExisting(uint64_t UcAddr, void* HostPtr, uint64_t Size, co
 
     uint64_t AlignedSize = PAGE_ALIGN_UP(Size);
 
+    BumpMapGeneration();
     UcToHostMap[UcAddr] = HostPtr;
     HostToUcMap[HostPtr] = UcAddr;
     PoolSizes[UcAddr] = AlignedSize;
@@ -273,6 +317,7 @@ uint64_t UnicornMem::AllocateUsermode(uc_engine* Uc, uint64_t Size, void* HostBu
         return 0;
     }
 
+    BumpMapGeneration();
     UcToHostMap[CurrentAddr] = HostBuf;
     HostToUcMap[HostBuf] = CurrentAddr;
     PoolSizes[CurrentAddr] = AlignedSize;
@@ -311,6 +356,7 @@ void UnicornMem::FreeUsermode(uc_engine* Uc, uint64_t UcAddr) {
     uc_mem_unmap(Uc, UcAddr, AllocSize);
 
     HostToUcMap.erase(HostBuf);
+    BumpMapGeneration();
     UcToHostMap.erase(It);
     PoolSizes.erase(UcAddr);
     PoolNames.erase(UcAddr);
