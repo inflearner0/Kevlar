@@ -6,6 +6,11 @@
 #include "core/diagnostics/diag_center.h"
 #include "host/providers/provider.h"
 #include <PEMapper/pefile.h>
+#include <cstdlib>
+#include <atomic>
+#include <algorithm>
+#include <vector>
+#include <unordered_map>
 
 extern void OnRipRingTrace(uc_engine* Uc, uint64_t Addr, uint32_t Size, void* UserData);
 
@@ -626,8 +631,262 @@ void UnicornEmu::InstallWatchpoints(uc_engine* Uc) {
     } else {
         RipRingIdx = 0;
         RipRingTotal = 0;
-        Logger::Log("{YEL}FAST MODE: Skipping driver self-read hook, RIP ring trace, sysmod read hooks{RESET}\n");
+        const char* StatusTrace = std::getenv("KEVLAR_STATUS_TRACE");
+        if (StatusTrace && StatusTrace[0] != '0') {
+            using RipTraceFn = void(*)(uc_engine*, uint64_t, uint32_t, void*);
+            static RipTraceFn RipTracePtr = OnRipRingTrace;
+            Err = uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)RipTracePtr, nullptr,
+                DRIVER_BASE_UC, DRIVER_BASE_UC + 0x3000000ULL - 1);
+            if (Err == UC_ERR_OK) {
+                Logger::Log("{CYN}FAST MODE: Lightweight DriverEntry status trace installed (last %d instructions){RESET}\n",
+                    RIP_RING_SIZE);
+            } else {
+                Logger::Log("{RED}FAST MODE: Failed to install lightweight status trace: %s{RESET}\n", uc_strerror(Err));
+            }
+        }
+        Logger::Log("{YEL}FAST MODE: Skipping driver self-read and sysmod read hooks{RESET}\n");
     }
 
     
+}
+
+// ---------------------------------------------------------------------------
+// Hot-block profiler (--blockprof). A basic-block hook feeding a fixed-size
+// table of atomics: cheap enough to leave on for a multi-minute run, readable
+// from the heartbeat thread while the guest keeps running, and the per-interval
+// delta answers what a 5s RIP sample cannot - whether the guest is cycling over
+// a handful of blocks or making forward progress through new code.
+// ---------------------------------------------------------------------------
+namespace {
+    constexpr size_t kBlockProfSlots = 1u << 17;
+    constexpr int kBlockProfProbes = 8;
+
+    struct BlockProfSlot {
+        std::atomic<uint64_t> Addr;
+        std::atomic<uint64_t> Count;
+    };
+
+    BlockProfSlot gBlockProf[kBlockProfSlots];
+    std::atomic<uint64_t> gBlockProfTotal{ 0 };
+    std::atomic<uint64_t> gBlockProfDropped{ 0 };
+    uint64_t gBlockProfLastTotal = 0;
+    std::unordered_map<uint64_t, uint64_t> gBlockProfLastCounts;
+}
+
+// Where the guest's loads land, by region. A loop that makes no API calls is
+// polling memory; this says which memory.
+namespace {
+    enum ReadBucket {
+        ReadBucketKusd = 0, ReadBucketHvsp, ReadBucketHyperspace, ReadBucketDriver,
+        ReadBucketStack, ReadBucketPool, ReadBucketSysMod, ReadBucketKernelStruct,
+        ReadBucketSentinel, ReadBucketOther, ReadBucketCount
+    };
+
+    const char* kReadBucketNames[ReadBucketCount] = {
+        "KUSD", "HvSharedPage", "hyperspace", "driver image",
+        "stack", "pool", "system modules", "KPCR/ETHREAD/EPROCESS",
+        "sentinels", "other"
+    };
+
+    std::atomic<uint64_t> gReadBuckets[ReadBucketCount];
+    std::atomic<uint64_t> gKusdOffsets[512];
+
+    // Per-bucket address span for the current interval: a sweep (unpack, hash,
+    // signature scan) walks its range, a spin keeps re-reading the same words.
+    std::atomic<uint64_t> gReadMin[ReadBucketCount];
+    std::atomic<uint64_t> gReadMax[ReadBucketCount];
+    std::atomic<uint64_t> gReadPages[ReadBucketCount];
+}
+
+static void TrackReadSpan(int Bucket, uint64_t Addr) {
+    uint64_t Min = gReadMin[Bucket].load(std::memory_order_relaxed);
+    while (Addr < Min) {
+        if (gReadMin[Bucket].compare_exchange_weak(Min, Addr, std::memory_order_relaxed))
+            break;
+    }
+
+    uint64_t Max = gReadMax[Bucket].load(std::memory_order_relaxed);
+    while (Addr > Max) {
+        if (gReadMax[Bucket].compare_exchange_weak(Max, Addr, std::memory_order_relaxed))
+            break;
+    }
+}
+
+static void OnReadProfile(uc_engine* Uc, uc_mem_type Type, uint64_t Addr, int Size,
+                          int64_t Value, void* UserData) {
+    int Bucket = ReadBucketOther;
+
+    if (Addr >= KUSD_BASE_UC && Addr < KUSD_BASE_UC + 0x1000) {
+        Bucket = ReadBucketKusd;
+        gKusdOffsets[(Addr - KUSD_BASE_UC) >> 3].fetch_add(1, std::memory_order_relaxed);
+    } else if (Addr >= HYPERVISOR_SHARED_PAGE_BASE_UC && Addr < HYPERVISOR_SHARED_PAGE_BASE_UC + 0x1000) {
+        Bucket = ReadBucketHvsp;
+    } else if (Addr >= HYPERSPACE_BASE_UC && Addr < HYPERSPACE_BASE_UC + HYPERSPACE_SIZE_UC) {
+        Bucket = ReadBucketHyperspace;
+    } else if (Addr >= DRIVER_BASE_UC && Addr < DRIVER_BASE_UC + 0x10000000ULL) {
+        Bucket = ReadBucketDriver;
+    } else if (Addr >= STACK_BASE_UC && Addr < STACK_BASE_UC + STACK_SIZE_UC) {
+        Bucket = ReadBucketStack;
+    } else if (Addr >= POOL_BASE_UC && Addr < POOL_BASE_UC + 0x100000000ULL) {
+        Bucket = ReadBucketPool;
+    } else if (Addr >= SYSMOD_BASE_UC && Addr < SYSMOD_BASE_UC + 0x100000000ULL) {
+        Bucket = ReadBucketSysMod;
+    } else if (Addr >= KPCR_BASE_UC && Addr < KPCR_BASE_UC + 0x1000000ULL) {
+        Bucket = ReadBucketKernelStruct;
+    } else if (Addr >= SENTINEL_BASE_UC && Addr < SENTINEL_BASE_UC + SENTINEL_RANGE_SIZE) {
+        Bucket = ReadBucketSentinel;
+    }
+
+    gReadBuckets[Bucket].fetch_add(1, std::memory_order_relaxed);
+    TrackReadSpan(Bucket, Addr);
+}
+
+static void OnBlockProfile(uc_engine* Uc, uint64_t Addr, uint32_t Size, void* UserData) {
+    gBlockProfTotal.fetch_add(1, std::memory_order_relaxed);
+
+    uint64_t Hash = (Addr * 0x9E3779B97F4A7C15ULL) >> 47;
+    for (int Probe = 0; Probe < kBlockProfProbes; Probe++) {
+        auto& Slot = gBlockProf[(Hash + Probe) & (kBlockProfSlots - 1)];
+        uint64_t Existing = Slot.Addr.load(std::memory_order_relaxed);
+        if (Existing == Addr) {
+            Slot.Count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (Existing == 0) {
+            uint64_t Expected = 0;
+            if (Slot.Addr.compare_exchange_strong(Expected, Addr, std::memory_order_relaxed) ||
+                Slot.Addr.load(std::memory_order_relaxed) == Addr) {
+                Slot.Count.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
+
+    gBlockProfDropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void UnicornEmu::InstallBlockProfiler(uc_engine* Uc) {
+    if (!BlockProfileEnabled)
+        return;
+
+    for (int I = 0; I < ReadBucketCount; I++) {
+        gReadMin[I].store(~0ULL, std::memory_order_relaxed);
+        gReadMax[I].store(0, std::memory_order_relaxed);
+    }
+
+    uc_hook Hh;
+    uc_err Err = uc_hook_add(Uc, &Hh, UC_HOOK_BLOCK, (void*)OnBlockProfile, nullptr, 1, 0);
+    if (Err != UC_ERR_OK)
+        Logger::Log("{RED}Block profiler hook failed: %s{RESET}\n", uc_strerror(Err));
+
+    uc_hook ReadHh;
+    Err = uc_hook_add(Uc, &ReadHh, UC_HOOK_MEM_READ, (void*)OnReadProfile, nullptr, 1, 0);
+    if (Err != UC_ERR_OK)
+        Logger::Log("{RED}Read profiler hook failed: %s{RESET}\n", uc_strerror(Err));
+}
+
+void UnicornEmu::DumpBlockProfile(const char* Reason) {
+    if (!BlockProfileEnabled)
+        return;
+
+    struct ProfEntry { uint64_t Addr; uint64_t Count; uint64_t Delta; };
+    std::vector<ProfEntry> Entries;
+
+    for (size_t I = 0; I < kBlockProfSlots; I++) {
+        uint64_t Addr = gBlockProf[I].Addr.load(std::memory_order_relaxed);
+        if (!Addr)
+            continue;
+
+        uint64_t Count = gBlockProf[I].Count.load(std::memory_order_relaxed);
+        uint64_t Prev = 0;
+        auto It = gBlockProfLastCounts.find(Addr);
+        if (It != gBlockProfLastCounts.end())
+            Prev = It->second;
+
+        Entries.push_back({ Addr, Count, Count - Prev });
+        gBlockProfLastCounts[Addr] = Count;
+    }
+
+    uint64_t Total = gBlockProfTotal.load(std::memory_order_relaxed);
+    uint64_t TotalDelta = Total - gBlockProfLastTotal;
+    gBlockProfLastTotal = Total;
+
+    std::sort(Entries.begin(), Entries.end(),
+        [](const ProfEntry& A, const ProfEntry& B) { return A.Delta > B.Delta; });
+
+    Logger::Log("{CYN}[BLOCKPROF %s] %llu blocks total (+%llu), %zu distinct, %llu dropped{RESET}\n",
+        Reason, Total, TotalDelta, Entries.size(), gBlockProfDropped.load(std::memory_order_relaxed));
+
+    Logger::Log("{CYN}[BLOCKPROF] uc_emu_start re-entries: %llu, instructions emulated by host: %llu{RESET}\n",
+        UnicornEmu::GetEmuStartCount(), UnicornEmu::GetInsnEmulatedCount());
+
+    uint64_t ReadTotal = 0;
+    for (int I = 0; I < ReadBucketCount; I++)
+        ReadTotal += gReadBuckets[I].load(std::memory_order_relaxed);
+
+    if (ReadTotal) {
+        char ReadLine[512];
+        int Used = 0;
+        for (int I = 0; I < ReadBucketCount; I++) {
+            uint64_t Count = gReadBuckets[I].load(std::memory_order_relaxed);
+            if (!Count)
+                continue;
+            Used += snprintf(ReadLine + Used, sizeof(ReadLine) - Used, "%s=%.1f%% ",
+                kReadBucketNames[I], 100.0 * (double)Count / (double)ReadTotal);
+            if (Used >= (int)sizeof(ReadLine) - 32)
+                break;
+        }
+        Logger::Log("{CYN}[READPROF] %llu reads: %s{RESET}\n", ReadTotal, ReadLine);
+
+        for (int I = 0; I < ReadBucketCount; I++) {
+            uint64_t Count = gReadBuckets[I].load(std::memory_order_relaxed);
+            if (!Count)
+                continue;
+
+            uint64_t Min = gReadMin[I].load(std::memory_order_relaxed);
+            uint64_t Max = gReadMax[I].load(std::memory_order_relaxed);
+            if (Min > Max)
+                continue;
+
+            Logger::Log("{GRY}  %-22s span 0x%llx - 0x%llx (%llu KB)  reads=%llu{RESET}\n",
+                kReadBucketNames[I], Min, Max, (Max - Min) / 1024, Count);
+
+            // Reset the span each interval so the next dump shows fresh movement.
+            gReadMin[I].store(~0ULL, std::memory_order_relaxed);
+            gReadMax[I].store(0, std::memory_order_relaxed);
+        }
+
+        uint64_t KusdReads = gReadBuckets[ReadBucketKusd].load(std::memory_order_relaxed);
+        if (KusdReads) {
+            char KusdLine[512];
+            int KusdUsed = 0;
+            for (int I = 0; I < 512; I++) {
+                uint64_t Count = gKusdOffsets[I].load(std::memory_order_relaxed);
+                if (!Count)
+                    continue;
+                KusdUsed += snprintf(KusdLine + KusdUsed, sizeof(KusdLine) - KusdUsed,
+                    "+0x%x:%llu ", (unsigned)(I * 8), Count);
+                if (KusdUsed >= (int)sizeof(KusdLine) - 24)
+                    break;
+            }
+            Logger::Log("{CYN}[READPROF] KUSD offsets: %s{RESET}\n", KusdLine);
+        }
+    }
+
+    int Shown = 0;
+    for (auto& E : Entries) {
+        if (Shown >= 12 || E.Delta == 0)
+            break;
+        Shown++;
+
+        double Share = TotalDelta ? (100.0 * (double)E.Delta / (double)TotalDelta) : 0.0;
+        bool InDriver = (E.Addr >= DRIVER_BASE_UC && E.Addr < DRIVER_BASE_UC + 0x10000000ULL);
+        if (InDriver) {
+            Logger::Log("{GRY}  drv+0x%-9llx +%-12llu (%5.1f%%) total %llu{RESET}\n",
+                E.Addr - DRIVER_BASE_UC, E.Delta, Share, E.Count);
+        } else {
+            Logger::Log("{GRY}  0x%-13llx +%-12llu (%5.1f%%) total %llu{RESET}\n",
+                E.Addr, E.Delta, Share, E.Count);
+        }
+    }
 }

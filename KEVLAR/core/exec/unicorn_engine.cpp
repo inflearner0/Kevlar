@@ -15,6 +15,8 @@ bool UnicornEmu::SehDispatchEnabled = true;
 bool UnicornEmu::ModuleReadLoggingEnabled = false;
 bool UnicornEmu::IntelCpuSpoofEnabled = false;
 bool UnicornEmu::DevirtualizationTest = false;
+bool UnicornEmu::BlockProfileEnabled = false;
+uint32_t UnicornEmu::BlockProfileIntervalSec = 30;
 bool UnicornEmu::RdmsrInsnHookSupported = false;
 bool UnicornEmu::WrmsrInsnHookSupported = false;
 bool UnicornEmu::MsrCodeInterceptEnabled = false;
@@ -338,6 +340,8 @@ void UnicornEmu::SetupHooks(uc_engine* Uc) {
     uc_hook_add(Uc, &Hh, UC_HOOK_INSN, (void*)Hooks::OnCpuid, nullptr, 1, 0, UC_X86_INS_CPUID);
     uc_hook_add(Uc, &Hh, UC_HOOK_INSN, (void*)Hooks::OnVmEnter, nullptr, 1, 0, UC_X86_INS_VMRESUME);
     uc_hook_add(Uc, &Hh, UC_HOOK_INSN, (void*)Hooks::OnVmExit, nullptr, 1, 0, UC_X86_INS_VMXOFF);
+
+    InstallBlockProfiler(Uc);
 }
 
 void UnicornEmu::SetupGdt(uc_engine* Uc) {

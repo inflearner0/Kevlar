@@ -5,6 +5,17 @@
 #include "core/exec/instruction_emulator.h"
 #include "core/memory/unicorn_memory.h"
 #include "core/exception/seh_dispatch.h"
+#include <atomic>
+
+// Every instruction Unicorn cannot execute costs a full exit from uc_emu_start
+// plus a re-entry, which is orders of magnitude more expensive than the
+// instruction itself. On virtualised code that can dominate the whole run, so
+// the two counters below are what tell the difference.
+static std::atomic<uint64_t> gEmuStartCount{ 0 };
+static std::atomic<uint64_t> gInsnEmulatedCount{ 0 };
+
+uint64_t UnicornEmu::GetEmuStartCount() { return gEmuStartCount.load(std::memory_order_relaxed); }
+uint64_t UnicornEmu::GetInsnEmulatedCount() { return gInsnEmulatedCount.load(std::memory_order_relaxed); }
 
 struct EmulationLoopResult {
     bool Ok;
@@ -21,6 +32,7 @@ static EmulationLoopResult RunEmulationLoop(uc_engine* Uc, uint64_t EntryPoint) 
 
     __try {
     for (;;) {
+        gEmuStartCount.fetch_add(1, std::memory_order_relaxed);
         uc_err Err = uc_emu_start(Uc, CurrentEmuRip, SENTINEL_RET_ADDR, 0, 0);
 
         if (UnicornEmu::SseFault.Active) {
@@ -45,6 +57,7 @@ static EmulationLoopResult RunEmulationLoop(uc_engine* Uc, uint64_t EntryPoint) 
 
             if (Err == UC_ERR_INSN_INVALID) {
                 if (InsnEmulator::TryEmulate(Uc, CurrentRip)) {
+                    gInsnEmulatedCount.fetch_add(1, std::memory_order_relaxed);
                     uc_reg_read(Uc, UC_X86_REG_RIP, &CurrentEmuRip);
                     continue;
                 }
@@ -101,10 +114,23 @@ bool UnicornEmu::StartEmulation(uc_engine* Uc, uint64_t EntryPoint) {
         LARGE_INTEGER Freq, Start;
         QueryPerformanceFrequency(&Freq);
         QueryPerformanceCounter(&Start);
+        double LastBeat = 0.0;
         while (HeartbeatRunning) {
-            Sleep(5000);
+            // KUSD is the guest's only clock between API calls: a driver polling
+            // tick or interrupt time needs it to advance at something like the
+            // real 15.6ms cadence, not once per heartbeat. Logging stays at 5s.
+            Sleep(1);
             if (!HeartbeatRunning) break;
             UnicornEmu::UpdateKusdTimeValues();
+
+            {
+                LARGE_INTEGER BeatNow;
+                QueryPerformanceCounter(&BeatNow);
+                double BeatElapsed = (double)(BeatNow.QuadPart - Start.QuadPart) / (double)Freq.QuadPart;
+                if (BeatElapsed - LastBeat < 5.0)
+                    continue;
+                LastBeat = BeatElapsed;
+            }
             uint64_t Rip = 0;
             uc_reg_read(HeartbeatUc, UC_X86_REG_RIP, &Rip);
             LARGE_INTEGER Now;
@@ -112,6 +138,37 @@ bool UnicornEmu::StartEmulation(uc_engine* Uc, uint64_t EntryPoint) {
             double Elapsed = (double)(Now.QuadPart - Start.QuadPart) / (double)Freq.QuadPart;
             uint64_t DriverRva = (Rip >= DRIVER_BASE_UC) ? (Rip - DRIVER_BASE_UC) : 0;
             Logger::Log("{GRY}[HEARTBEAT %.1fs] RIP=0x%llx (drv+0x%llx){RESET}\n", Elapsed, Rip, DriverRva);
+
+            if (UnicornEmu::BlockProfileEnabled) {
+                // A register walking a range at a steady rate is what separates a
+                // long bounded computation (image hash, decrypt) from a spin.
+                static const int SampleRegs[] = {
+                    UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX,
+                    UC_X86_REG_RSI, UC_X86_REG_RDI, UC_X86_REG_RBP, UC_X86_REG_RSP,
+                    UC_X86_REG_R8,  UC_X86_REG_R9,  UC_X86_REG_R10, UC_X86_REG_R11,
+                    UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15 };
+                static const char* SampleNames[] = {
+                    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                    "r8 ", "r9 ", "r10", "r11", "r12", "r13", "r14", "r15" };
+
+                char RegLine[512];
+                int Used = 0;
+                for (int RegIdx = 0; RegIdx < 16; RegIdx++) {
+                    uint64_t RegVal = 0;
+                    uc_reg_read(HeartbeatUc, SampleRegs[RegIdx], &RegVal);
+                    Used += snprintf(RegLine + Used, sizeof(RegLine) - Used, "%s=%llx ",
+                        SampleNames[RegIdx], RegVal);
+                    if (Used >= (int)sizeof(RegLine) - 32)
+                        break;
+                }
+                Logger::Log("{GRY}[REGS %.1fs] %s{RESET}\n", Elapsed, RegLine);
+
+                static double LastProfileDump = 0.0;
+                if (Elapsed - LastProfileDump >= (double)UnicornEmu::BlockProfileIntervalSec) {
+                    LastProfileDump = Elapsed;
+                    UnicornEmu::DumpBlockProfile("heartbeat");
+                }
+            }
 
             if (IntelCpuSpoofEnabled) {
                 static bool PtDetected = false;
@@ -313,5 +370,5 @@ bool UnicornEmu::StartEmulation(uc_engine* Uc, uint64_t EntryPoint) {
         }
     }
 
-    return true;
+    return Rax == 0;
 }

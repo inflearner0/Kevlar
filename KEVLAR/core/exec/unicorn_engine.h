@@ -19,6 +19,7 @@
 #define KPRCB_BASE_UC         0xFFFFF80200010000ULL
 #define ETHREAD_BASE_UC       0xFFFFF80200020000ULL
 #define EPROCESS_BASE_UC      0xFFFFF80200030000ULL
+#define TOKEN_BASE_UC         (EPROCESS_BASE_UC + 0x8000ULL)
 #define DRIVER_OBJ_BASE_UC    0xFFFFF80200040000ULL
 #define REGISTRY_PATH_BASE_UC 0xFFFFF80200050000ULL
 #define LDR_ENTRIES_BASE_UC   0xFFFFF80200060000ULL
@@ -102,6 +103,10 @@ bool Initialize();
 void Shutdown();
 uc_engine* CreateEngine();
 void SetupHooks(uc_engine* Uc);
+void InstallBlockProfiler(uc_engine* Uc);
+void DumpBlockProfile(const char* Reason);
+uint64_t GetEmuStartCount();
+uint64_t GetInsnEmulatedCount();
 void SetupGdt(uc_engine* Uc);
 void SetupIdt(uc_engine* Uc);
 void SetupSegmentRegisters(uc_engine* Uc);
@@ -170,6 +175,8 @@ extern bool SehDispatchEnabled;
 extern bool ModuleReadLoggingEnabled;
 extern bool IntelCpuSpoofEnabled;
 extern bool DevirtualizationTest;
+extern bool BlockProfileEnabled;
+extern uint32_t BlockProfileIntervalSec;
 extern bool RdmsrInsnHookSupported;
 extern bool WrmsrInsnHookSupported;
 extern bool MsrCodeInterceptEnabled;

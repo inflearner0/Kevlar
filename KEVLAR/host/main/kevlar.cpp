@@ -204,11 +204,17 @@ int main(int Argc, char* Argv[]) {
     });
     InitDirs();
 
-    auto LogPath = KevlarGlobal::ExeDir + "kevlar.log";
+    const char* LogPathOverride = std::getenv("KEVLAR_LOG_PATH");
+    auto LogPath = (LogPathOverride && LogPathOverride[0])
+        ? std::string(LogPathOverride)
+        : KevlarGlobal::ExeDir + "kevlar.log";
     Logger::InitFile(LogPath.c_str());
     atexit(Logger::CloseFile);
 
-    auto ThreadLogDir = KevlarGlobal::ExeDir + "easyanticheat_threads";
+    const char* ThreadLogDirOverride = std::getenv("KEVLAR_THREAD_LOG_DIR");
+    auto ThreadLogDir = (ThreadLogDirOverride && ThreadLogDirOverride[0])
+        ? std::string(ThreadLogDirOverride)
+        : KevlarGlobal::ExeDir + "easyanticheat_threads";
     if (Logger::EnablePerThreadFiles(ThreadLogDir.c_str())) {
         Logger::MarkThreadStart("main");
         Logger::Log("{CYN}Per-thread logging enabled: {WHT}%s{RESET}\n", ThreadLogDir.c_str());
@@ -234,6 +240,7 @@ int main(int Argc, char* Argv[]) {
         Logger::Log("  --seed <n>              Deterministic seed for TSC jitter (default fixed){RESET}\n");
         Logger::Log("  --vgk-override          Override STATUS_ACCESS_DENIED from vgk DriverEntry{RESET}\n");
         Logger::Log("  --devirt                Enable devirtualization testing{RESET}\n");
+        Logger::Log("  --blockprof[=secs]      Hot basic-block profiler (default dump every 30s){RESET}\n");
         Logger::Log("  --strict-exports        Unhandled exports return STATUS_NOT_IMPLEMENTED instead of 0{RESET}\n");
         Logger::Log("  --provenance            Trace branch decisions + API results for rejection paths{RESET}\n");
         Logger::Log("  --trace <file>          Record deterministic execution trace{RESET}\n");
@@ -303,6 +310,14 @@ int main(int Argc, char* Argv[]) {
                 } else {
                     Logger::Log("{RED}--seed requires a value (e.g. --seed 0x1234){RESET}\n");
                 }
+            } else if (Arg.rfind("--blockprof", 0) == 0) {
+                UnicornEmu::BlockProfileEnabled = true;
+                if (Arg.size() > 11 && Arg[11] == '=')
+                    UnicornEmu::BlockProfileIntervalSec = (uint32_t)strtoul(Arg.substr(12).c_str(), nullptr, 0);
+                if (UnicornEmu::BlockProfileIntervalSec == 0)
+                    UnicornEmu::BlockProfileIntervalSec = 30;
+                Logger::Log("{CYN}Hot-block profiler ENABLED (dump every %us){RESET}\n",
+                    UnicornEmu::BlockProfileIntervalSec);
             } else if (Arg.rfind("--devirt", 0) == 0) {
                 UnicornEmu::DevirtualizationTest = true;
                 Logger::Log("{CYN}Devirtualization Testing ENABLED{RESET}\n");
@@ -378,6 +393,8 @@ int main(int Argc, char* Argv[]) {
         PrintUsage(Argv[0]);
         return 1;
     }
+
+    UnicornEmu::InstallBlockProfiler(UnicornEmu::PrimaryEngine);
 
     Logger::Log("{CYN}[ARGS] driver=%s diag=%d vgk_override=%d{RESET}\n",
         DriverPath.c_str(),
