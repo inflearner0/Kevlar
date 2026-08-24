@@ -110,29 +110,43 @@ int64_t GetEmulatedQpcElapsed() {
     return EmulatedElapsed;
 }
 
+// The KUSD time fields are KSYSTEM_TIME { LowPart, High1Time, High2Time }, not
+// plain 64-bit values. Readers spin on
+//     do { High1 = t->High1Time; Low = t->LowPart; High2 = t->High2Time; }
+//     while (High1 != High2);
+// so a 64-bit store - which writes LowPart and High1Time and leaves High2Time at
+// whatever the host snapshot held - hangs every such reader forever. Write the
+// three fields the way the kernel does: High2Time, then LowPart, then High1Time.
+static void WriteKsystemTime(uint64_t UcAddr, int64_t Value) {
+    void* Host = UnicornMem::UcToHost(UcAddr);
+    if (!Host)
+        return;
+
+    auto Fields = (volatile uint32_t*)Host;
+    uint32_t Low = (uint32_t)((uint64_t)Value & 0xFFFFFFFFULL);
+    uint32_t High = (uint32_t)((uint64_t)Value >> 32);
+
+    Fields[2] = High;
+    Fields[0] = Low;
+    Fields[1] = High;
+}
+
 void UnicornEmu::UpdateKusdTimeValues() {
     if (QpcFrequency == 0) return;
 
     int64_t EmulatedElapsed = GetEmulatedQpcElapsed();
     int64_t ElapsedIn100Ns = (EmulatedElapsed * 10000000LL) / QpcFrequency;
 
-    void* InterruptTimeHost = UnicornMem::UcToHost(KUSD_BASE_UC + 0x08);
-    if (InterruptTimeHost) {
-        *(volatile int64_t*)InterruptTimeHost = ElapsedIn100Ns;
-    }
+    WriteKsystemTime(KUSD_BASE_UC + 0x08, ElapsedIn100Ns);
 
     int64_t VirtualSystemTime = EmulationStartSystemTime + ElapsedIn100Ns;
-    void* SystemTimeHost = UnicornMem::UcToHost(KUSD_BASE_UC + 0x14);
-    if (SystemTimeHost) {
-        *(volatile int64_t*)SystemTimeHost = VirtualSystemTime;
-    }
+    WriteKsystemTime(KUSD_BASE_UC + 0x14, VirtualSystemTime);
 
-    uint32_t VirtualTickCount = (uint32_t)(ElapsedIn100Ns / 156250);
-    void* TickHost = UnicornMem::UcToHost(KUSD_BASE_UC + 0x320);
-    if (TickHost) {
-        auto Tc = (volatile uint32_t*)TickHost;
-        Tc[0] = VirtualTickCount;
-        Tc[1] = 0;
-        Tc[2] = VirtualTickCount;
-    }
+    int64_t VirtualTickCount = ElapsedIn100Ns / 156250;
+    WriteKsystemTime(KUSD_BASE_UC + 0x320, VirtualTickCount);
+
+    // TickCountLowDeprecated tracks the low half of the same count.
+    void* TickLowHost = UnicornMem::UcToHost(KUSD_BASE_UC + 0x00);
+    if (TickLowHost)
+        *(volatile uint32_t*)TickLowHost = (uint32_t)VirtualTickCount;
 }
