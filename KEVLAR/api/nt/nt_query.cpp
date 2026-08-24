@@ -241,8 +241,16 @@ static NTSTATUS SafeNtQuerySystemInformation(uint32_t Class, uintptr_t Buf, ULON
 static NTSTATUS SafeNtQuerySystemInformationLocalBuf(uint32_t Class, ULONG Len, PULONG RetLen, uint8_t* LocalBuf, ULONG LocalBufSize) {
     ULONG RequiredLen = 0;
     NTSTATUS Status;
+
+    // Len is what the caller wants the API to see; LocalBufSize is only how much
+    // room the scratch buffer actually has. Passing the buffer size instead of Len
+    // fails every fixed-size class, which require an exact length match.
+    ULONG QueryLen = Len;
+    if (QueryLen > LocalBufSize)
+        QueryLen = LocalBufSize;
+
     __try {
-        Status = NtQuerySystemInformation(Class, LocalBuf, LocalBufSize, &RequiredLen);
+        Status = NtQuerySystemInformation(Class, LocalBuf, QueryLen, &RequiredLen);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("{RED}SafeNtQuerySystemInformationLocalBuf CRASH: class=0x%x exception=0x%08x{RESET}\n",
             Class, GetExceptionCode());
