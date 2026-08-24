@@ -475,6 +475,11 @@ int main(int Argc, char* Argv[]) {
     }
     Logger::Log("{GRN}Driver mapped. {GRY}Resolving imports.{RESET}\n");
 
+    // Now that the image is in memory the MSR intercept can be narrowed from the
+    // whole driver range down to the pages that actually contain rdmsr/wrmsr.
+    if (UnicornEmu::MsrCodeInterceptEnabled)
+        UnicornEmu::InstallMsrIntercept(UnicornEmu::PrimaryEngine);
+
     Logger::Log("{GRY}Resolving Imports...{RESET}");
     MainModule->ResolveImport();
     Logger::Log("{GRN}Imports Resolved.{RESET}\n");

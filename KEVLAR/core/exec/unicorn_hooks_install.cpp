@@ -380,16 +380,7 @@ void UnicornEmu::InstallWatchpoints(uc_engine* Uc) {
 
     if (!UnicornEmu::RdmsrInsnHookSupported || !UnicornEmu::WrmsrInsnHookSupported) {
         UnicornEmu::MsrCodeInterceptEnabled = true;
-        uc_hook MsrFallbackHook;
-        uc_err MsrFallbackErr = uc_hook_add(Uc, &MsrFallbackHook, UC_HOOK_CODE, (void*)Hooks::OnMsrFallback, nullptr,
-            DRIVER_BASE_UC, DRIVER_BASE_UC + 0x10000000ULL - 1);
-        if (MsrFallbackErr == UC_ERR_OK) {
-            Logger::Log("{GRN}MSR fallback code hook installed (rdmsr=%d wrmsr=%d){RESET}\n",
-                UnicornEmu::RdmsrInsnHookSupported ? 1 : 0,
-                UnicornEmu::WrmsrInsnHookSupported ? 1 : 0);
-        } else {
-            Logger::Log("{RED}MSR fallback code hook failed: %s{RESET}\n", uc_strerror(MsrFallbackErr));
-        }
+        UnicornEmu::InstallMsrIntercept(Uc);
     }
 
     if (DiagnosticHooksEnabled) {
@@ -448,10 +439,16 @@ void UnicornEmu::InstallWatchpoints(uc_engine* Uc) {
     Logger::Log("{GRN}KUSD time values: periodic heartbeat updates%s{RESET}\n",
         KusdReadHookInstalled ? " + read hook" : " (no read hook)");
 
+    // This watchpoint only records what the guest read; it never feeds the guest a
+    // value. Keeping it always-on costs the whole run, because a single
+    // UC_HOOK_MEM_READ makes Unicorn route every guest load through a helper, so
+    // it belongs with the rest of the diagnostics.
     uc_hook HhHvPage;
-    Err = uc_hook_add(Uc, &HhHvPage, UC_HOOK_MEM_READ, (void*)Hooks::OnHypervisorSharedPageRead, nullptr,
-        HYPERVISOR_SHARED_PAGE_BASE_UC, HYPERVISOR_SHARED_PAGE_BASE_UC + 0x1000 - 1);
-    if (Err == UC_ERR_OK) {
+    Err = (DiagnosticHooksEnabled || ModuleReadLoggingEnabled)
+        ? uc_hook_add(Uc, &HhHvPage, UC_HOOK_MEM_READ, (void*)Hooks::OnHypervisorSharedPageRead, nullptr,
+            HYPERVISOR_SHARED_PAGE_BASE_UC, HYPERVISOR_SHARED_PAGE_BASE_UC + 0x1000 - 1)
+        : UC_ERR_OK;
+    if (Err == UC_ERR_OK && (DiagnosticHooksEnabled || ModuleReadLoggingEnabled)) {
         Logger::Log("{CYN}Watchpoint: HypervisorSharedPage reads (0x%llx - 0x%llx){RESET}\n",
             HYPERVISOR_SHARED_PAGE_BASE_UC, HYPERVISOR_SHARED_PAGE_BASE_UC + 0x1000 - 1);
     } else {
@@ -889,4 +886,92 @@ void UnicornEmu::DumpBlockProfile(const char* Reason) {
                 E.Addr, E.Delta, Share, E.Count);
         }
     }
+}
+
+
+// A UC_HOOK_CODE spanning the whole driver range fires for every instruction the
+// guest executes and stops Unicorn chaining basic blocks, which on virtualised
+// code costs far more than the handful of MSR accesses it exists to catch. The
+// rdmsr/wrmsr encodings are two bytes, so find the pages that actually contain
+// them and hook only those - on a 13MB virtualised driver that is ~7% of the
+// executable pages.
+//
+// ponytail: the scan runs once, over the image as mapped. Code decrypted into
+// pages that held no 0F 30 / 0F 32 at scan time is not intercepted; extend this
+// with a write-triggered rescan when a driver is observed doing that.
+static uc_hook gMsrWideHook = 0;
+static uc_engine* gMsrWideEngine = nullptr;
+
+void UnicornEmu::InstallMsrIntercept(uc_engine* Uc) {
+    uint64_t ImageBase = 0;
+    uint64_t ImageSize = 0;
+    const uint8_t* ImageHost = nullptr;
+
+    for (auto& Region : MappedRegions) {
+        if (Region.Name == "DriverImage") {
+            ImageBase = Region.UcBase;
+            ImageSize = Region.Size;
+            ImageHost = (const uint8_t*)Region.HostPtr;
+            break;
+        }
+    }
+
+    uc_hook Hh;
+
+    if (!ImageHost || ImageSize < 2) {
+        // Called before the driver is mapped (engine setup): cover everything and
+        // let the post-load call narrow it down.
+        uc_err WideErr = uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)Hooks::OnMsrFallback, nullptr,
+            DRIVER_BASE_UC, DRIVER_BASE_UC + 0x10000000ULL - 1);
+        if (WideErr == UC_ERR_OK) {
+            gMsrWideHook = Hh;
+            gMsrWideEngine = Uc;
+        }
+        Logger::Log("{GRN}MSR intercept: whole-image code hook (driver not mapped yet)%s{RESET}\n",
+            WideErr == UC_ERR_OK ? "" : " FAILED");
+        return;
+    }
+
+    // Drop the whole-image hook installed before the driver was mapped.
+    if (gMsrWideHook && gMsrWideEngine == Uc) {
+        uc_hook_del(Uc, gMsrWideHook);
+        gMsrWideHook = 0;
+        gMsrWideEngine = nullptr;
+    }
+
+    std::vector<std::pair<uint64_t, uint64_t>> Ranges;
+    for (uint64_t Offset = 0; Offset + 1 < ImageSize; Offset++) {
+        if (ImageHost[Offset] != 0x0F)
+            continue;
+        if (ImageHost[Offset + 1] != 0x30 && ImageHost[Offset + 1] != 0x32)
+            continue;
+
+        uint64_t PageStart = ImageBase + (Offset & ~0xFFFULL);
+        uint64_t PageEnd = PageStart + 0x1000;
+
+        // An encoding can carry prefixes, so include the tail of the page before it.
+        if (PageStart > ImageBase)
+            PageStart -= 0x10;
+
+        if (!Ranges.empty() && Ranges.back().second >= PageStart)
+            Ranges.back().second = PageEnd;
+        else
+            Ranges.push_back({ PageStart, PageEnd });
+    }
+
+    int Installed = 0;
+    for (auto& Range : Ranges) {
+        if (uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)Hooks::OnMsrFallback, nullptr,
+                Range.first, Range.second - 1) == UC_ERR_OK)
+            Installed++;
+    }
+
+    uint64_t Covered = 0;
+    for (auto& Range : Ranges)
+        Covered += Range.second - Range.first;
+
+    Logger::Log("{GRN}MSR intercept: %d ranges covering %llu KB of %llu KB image (rdmsr=%d wrmsr=%d){RESET}\n",
+        Installed, Covered / 1024, ImageSize / 1024,
+        UnicornEmu::RdmsrInsnHookSupported ? 1 : 0,
+        UnicornEmu::WrmsrInsnHookSupported ? 1 : 0);
 }

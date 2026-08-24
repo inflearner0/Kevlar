@@ -104,6 +104,7 @@ void Shutdown();
 uc_engine* CreateEngine();
 void SetupHooks(uc_engine* Uc);
 void InstallBlockProfiler(uc_engine* Uc);
+void InstallMsrIntercept(uc_engine* Uc);
 void DumpBlockProfile(const char* Reason);
 uint64_t GetEmuStartCount();
 uint64_t GetInsnEmulatedCount();
