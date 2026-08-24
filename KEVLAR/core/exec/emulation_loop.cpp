@@ -6,6 +6,8 @@
 #include "core/memory/unicorn_memory.h"
 #include "core/exception/seh_dispatch.h"
 #include <atomic>
+#include <vector>
+#include <unordered_map>
 
 // Every instruction Unicorn cannot execute costs a full exit from uc_emu_start
 // plus a re-entry, which is orders of magnitude more expensive than the
@@ -162,6 +164,44 @@ bool UnicornEmu::StartEmulation(uc_engine* Uc, uint64_t EntryPoint) {
                         break;
                 }
                 Logger::Log("{GRY}[REGS %.1fs] %s{RESET}\n", Elapsed, RegLine);
+
+                // Execution here reads only the driver's own image and stack, so
+                // it takes no input from the harness: if the same state shows up
+                // twice the guest is in a closed loop, and if it never repeats it
+                // is still doing new work. Fingerprint the VM context (around RBP)
+                // and the live stack (around RSP) to tell those apart.
+                {
+                    uint64_t Rbp = 0, Rsp = 0;
+                    uc_reg_read(HeartbeatUc, UC_X86_REG_RBP, &Rbp);
+                    uc_reg_read(HeartbeatUc, UC_X86_REG_RSP, &Rsp);
+
+                    auto Fingerprint = [&](uint64_t Base, uint64_t Size) -> uint64_t {
+                        std::vector<uint8_t> Buf(Size);
+                        if (uc_mem_read(HeartbeatUc, Base, Buf.data(), Size) != UC_ERR_OK)
+                            return 0;
+
+                        uint64_t Hash = 1469598103934665603ULL;
+                        for (uint8_t Byte : Buf) {
+                            Hash ^= Byte;
+                            Hash *= 1099511628211ULL;
+                        }
+                        return Hash;
+                    };
+
+                    uint64_t CtxHash = Fingerprint(Rbp & ~0xFFFULL, 0x1000);
+                    uint64_t StackHash = Fingerprint(Rsp & ~0xFFFULL, 0x1000);
+
+                    static std::unordered_map<uint64_t, double> SeenContext;
+                    auto Seen = SeenContext.find(CtxHash);
+                    if (Seen != SeenContext.end()) {
+                        Logger::Log("{RED}[STATE %.1fs] VM context repeats state last seen at %.1fs "
+                            "- closed loop{RESET}\n", Elapsed, Seen->second);
+                    } else {
+                        SeenContext[CtxHash] = Elapsed;
+                        Logger::Log("{GRY}[STATE %.1fs] ctx=%016llx stack=%016llx (new, %zu distinct){RESET}\n",
+                            Elapsed, CtxHash, StackHash, SeenContext.size());
+                    }
+                }
 
                 static double LastProfileDump = 0.0;
                 if (Elapsed - LastProfileDump >= (double)UnicornEmu::BlockProfileIntervalSec) {
