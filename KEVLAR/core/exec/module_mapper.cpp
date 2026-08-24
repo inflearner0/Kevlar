@@ -31,6 +31,66 @@ uint64_t UnicornEmu::AllocateSentinel(const char* FuncName, PVOID HostFunc, bool
     return Addr;
 }
 
+// A data import's IAT slot holds the address of an exported *variable*; the driver
+// dereferences the slot instead of calling through it. Handing it a code sentinel is
+// wrong twice over: the sentinel range is 0xC3 fill, so every read comes back as
+// 0xC3C3C3C3C3C3C3C3, and a driver walking (say) PsLoadedModuleList faults on the
+// first field it touches. PatchSystemModuleExports has already pointed
+// Provider::data_providers at the final guest address of every registered variable.
+static uint64_t ResolveDataImportUc(const char* DllName, const std::string& FuncName) {
+    {
+        std::shared_lock<std::shared_mutex> Guard(Provider::ProviderLock);
+        auto It = Provider::data_providers.find(FuncName);
+        if (It != Provider::data_providers.end() && It->second)
+            return (uint64_t)It->second;
+    }
+
+    // Unregistered exported data (HalDispatchTable and friends): use the variable in
+    // the mapped system module itself, already relocated into the guest. An export
+    // landing in a non-executable section is data by construction.
+    std::string WantName(DllName);
+    for (auto& C : WantName) C = (char)tolower(C);
+
+    for (auto& Mod : UnicornEmu::MappedSysMods) {
+        std::string ModName = Mod.Name;
+        for (auto& C : ModName) C = (char)tolower(C);
+        if (ModName != WantName || !Mod.Pe)
+            continue;
+
+        uint64_t Rva = Mod.Pe->GetExport(FuncName);
+        if (!Rva || Rva >= Mod.Size)
+            return 0;
+
+        auto HostBase = (uint8_t*)UnicornMem::UcToHost(Mod.UcBase);
+        if (!HostBase)
+            return 0;
+
+        auto Dos = (PIMAGE_DOS_HEADER)HostBase;
+        auto Nt = (PIMAGE_NT_HEADERS)(HostBase + Dos->e_lfanew);
+
+        // A forwarded export's RVA points at the forwarder string inside the export
+        // directory, which is data by section but a function by intent.
+        auto ExportDir = &Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (ExportDir->VirtualAddress && Rva >= ExportDir->VirtualAddress &&
+            Rva < (uint64_t)ExportDir->VirtualAddress + ExportDir->Size)
+            return 0;
+
+        auto Section = IMAGE_FIRST_SECTION(Nt);
+        for (WORD I = 0; I < Nt->FileHeader.NumberOfSections; I++) {
+            uint64_t SecStart = Section[I].VirtualAddress;
+            uint64_t SecEnd = SecStart + Section[I].Misc.VirtualSize;
+            if (Rva < SecStart || Rva >= SecEnd)
+                continue;
+            if (Section[I].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                return 0;
+            return Mod.UcBase + Rva;
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
 void UnicornEmu::BuildSentinelIat(PEFile* Module) {
     auto UcBase = DRIVER_BASE_UC;
     auto UcHostBase = (unsigned char*)UnicornMem::UcToHost(UcBase);
@@ -52,9 +112,11 @@ void UnicornEmu::BuildSentinelIat(PEFile* Module) {
     int CountProvider = 0;
     int CountPassthrough = 0;
     int CountUnimplemented = 0;
+    int CountData = 0;
     int CountTotal = 0;
 
     std::vector<std::string> UnimplList;
+    std::vector<std::string> DataList;
 
     for (; ImportDesc->Name; ImportDesc++) {
         auto DllName = (char*)(UcHostBase + ImportDesc->Name);
@@ -113,6 +175,18 @@ void UnicornEmu::BuildSentinelIat(PEFile* Module) {
                 SentinelAddr = AllocateSentinel(FuncName, Provider::function_providers[FuncNameStr]);
                 CountProvider++;
             } else {
+                uint64_t DataUcAddr = ResolveDataImportUc(DllName, FuncNameStr);
+                if (DataUcAddr) {
+                    auto DataThunkPtr = (uint64_t*)(UcHostBase + IatThunkRva);
+                    *DataThunkPtr = DataUcAddr;
+                    CountData++;
+
+                    char DataLine[320];
+                    sprintf_s(DataLine, "%s!%s -> UC 0x%llx", DllName, FuncNameStr.c_str(), DataUcAddr);
+                    DataList.push_back(std::string(DataLine));
+                    continue;
+                }
+
                 auto NtdllAddr = (PVOID)GetProcAddress(Ntdll, FuncName);
                 if (NtdllAddr) {
                     SentinelAddr = AllocateSentinel(FuncName, NtdllAddr, true);
@@ -131,8 +205,15 @@ void UnicornEmu::BuildSentinelIat(PEFile* Module) {
         }
     }
 
-    Logger::Log("{CYN}BuildSentinelIat: %d total imports, %d provider, %d passthrough, %d unimplemented{RESET}\n",
-        CountTotal, CountProvider, CountPassthrough, CountUnimplemented);
+    Logger::Log("{CYN}BuildSentinelIat: %d total imports, %d provider, %d passthrough, %d data, %d unimplemented{RESET}\n",
+        CountTotal, CountProvider, CountPassthrough, CountData, CountUnimplemented);
+
+    if (!DataList.empty()) {
+        Logger::Log("{GRN}Data imports bound to guest variables:{RESET}\n");
+        for (auto& Name : DataList) {
+            Logger::Log("{GRN}  [DATA] %s{RESET}\n", Name.c_str());
+        }
+    }
 
     if (!UnimplList.empty()) {
         Logger::Log("{YEL}Unimplemented imports:{RESET}\n");
