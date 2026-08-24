@@ -1,6 +1,7 @@
 #include "core/process/unicorn_threading.h"
 #include "core/exec/unicorn_engine.h"
 #include "core/exec/unicorn_engine_internal.h"
+#include "core/exec/instruction_emulator.h"
 #include "core/memory/unicorn_memory.h"
 #include "host/providers/ntoskrnl_provider.h"
 #include "include/ntoskrnl_struct.h"
@@ -63,7 +64,20 @@ static DWORD ThreadEntryCore(ThreadStartInfo* Info) {
     Logger::Log("{MAG}Thread %llu starting at 0x%llx{RESET}\n", Ctx->ThreadId, Info->StartRoutine);
 
     Ctx->Running = true;
-    auto Err = uc_emu_start(Info->Engine, Info->StartRoutine, SENTINEL_RET_ADDR, 0, 0);
+    uint64_t CurrentEmuRip = Info->StartRoutine;
+    uc_err Err = UC_ERR_OK;
+    for (;;) {
+        Err = uc_emu_start(Info->Engine, CurrentEmuRip, SENTINEL_RET_ADDR, 0, 0);
+        if (Err != UC_ERR_INSN_INVALID)
+            break;
+
+        uint64_t InvalidRip = 0;
+        uc_reg_read(Info->Engine, UC_X86_REG_RIP, &InvalidRip);
+        if (!InsnEmulator::TryEmulate(Info->Engine, InvalidRip))
+            break;
+
+        uc_reg_read(Info->Engine, UC_X86_REG_RIP, &CurrentEmuRip);
+    }
     Ctx->Running = false;
 
     if (Err != UC_ERR_OK) {

@@ -65,7 +65,12 @@ void PopulateKernelStructs() {
     *EprocUniqueProcessId(&FakeSystemProcess) = (void*)4;
     *EprocProtection(&FakeSystemProcess) = 7;
     *EprocWow64Process(&FakeSystemProcess) = nullptr;
+    // Keep the primary-token fast reference entirely in guest address space.
+    // Returning &HostEprocess->Token leaked a user-mode host pointer into the
+    // guest and eventually corrupted EAC's token-information parsing.
+    FakeSystemProcess.Token.Value = TOKEN_BASE_UC | 0xFULL;
     EprocCreateTime(&FakeSystemProcess)->QuadPart = GetTickCount64();
+    memcpy(EprocImageFileName(&FakeSystemProcess), "System", sizeof("System"));
 
     FakeCPU.CurrentThread = (_KTHREAD*)ETHREAD_BASE_UC;
     FakeCPU.IdleThread = (_KTHREAD*)ETHREAD_BASE_UC;

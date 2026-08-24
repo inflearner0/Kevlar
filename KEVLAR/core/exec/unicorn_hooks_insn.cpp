@@ -353,6 +353,7 @@ static bool RaxErrorCaught = false;
 static uint64_t LastRaxErrorRip = 0;
 static uint64_t LastRaxErrorInsn = 0;
 static int RaxErrorStreak = 0;
+static int RaxObjectNameNotFoundStreak = 0;
 void OnRipRingTrace(uc_engine* Uc, uint64_t Addr, uint32_t Size, void* UserData) {
     uint64_t Rax = 0;
     uc_reg_read(Uc, UC_X86_REG_RAX, &Rax);
@@ -360,6 +361,21 @@ void OnRipRingTrace(uc_engine* Uc, uint64_t Addr, uint32_t Size, void* UserData)
     E.Rip = Addr;
     E.Rax = Rax;
 
+    if ((uint32_t)Rax == 0xC0000034) {
+        RaxObjectNameNotFoundStreak++;
+    } else {
+        RaxObjectNameNotFoundStreak = 0;
+    }
+    if (RaxObjectNameNotFoundStreak == 3) {
+        Logger::Log("{RED}[STATUS-0x34 PERSISTENT] RAX remained STATUS_OBJECT_NAME_NOT_FOUND at RIP=drv+0x%llx insn#%llu{RESET}\n",
+            Addr - DRIVER_BASE_UC, RipRingTotal);
+        uint32_t Start = (RipRingIdx > 96) ? RipRingIdx - 96 : 0;
+        for (uint32_t I = Start; I <= (uint32_t)RipRingIdx; I++) {
+            auto& Prev = RipRingBuf[I % RIP_RING_SIZE];
+            Logger::Log("{RED}  [%llu] drv+0x%llx RAX=0x%llx{RESET}\n",
+                (uint64_t)I, Prev.Rip - DRIVER_BASE_UC, Prev.Rax);
+        }
+    }
     if (Rax == 0xC0000022) {
         if (RaxErrorStreak == 0)
             LastRaxErrorRip = Addr;
@@ -968,8 +984,13 @@ static void DetectionRecordWrmsr(uint32_t MsrId, uint64_t Value, uint64_t Rip) {
 
 static bool DecodeMsrInstructionAt(uc_engine* Uc, uint64_t Addr, bool& IsRead, uint32_t& InstructionLen) {
     uint8_t Bytes[16] = {};
-    if (uc_mem_read(Uc, Addr, Bytes, sizeof(Bytes)) != UC_ERR_OK)
+    // This runs from a UC_HOOK_CODE callback. Re-entering Unicorn through
+    // uc_mem_read here corrupts the translator's stack on long EAC runs.
+    // All driver image bytes are backed by KEVLAR's direct region mapping.
+    const void* HostBytes = UnicornMem::UcToHost(Addr);
+    if (!HostBytes)
         return false;
+    memcpy(Bytes, HostBytes, sizeof(Bytes));
 
     size_t PrefixLen = 0;
     while (PrefixLen < sizeof(Bytes)) {

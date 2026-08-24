@@ -72,68 +72,174 @@ static uint64_t h_HalGetBusDataByOffset(uint64_t BusDataType, uint64_t BusNumber
     return CopyLen;
 }
 
-static uint64_t h_HalAcpiGetTableEx(uint64_t Signature, uint64_t Instance, uint64_t OutTable, uint64_t OutSize) {
-    Logger::Log("{GRY}\tHalAcpiGetTableEx: sig=0x%x instance=%llu{RESET}\n", (uint32_t)Signature, Instance);
+// HalAcpiGetTableEx is undocumented, but the Windows implementation uses this
+// four-argument contract:
+//   PVOID HalAcpiGetTableEx(PVOID Context, ULONG Signature,
+//                           const char* OemId, const char* OemTableId);
+// It returns an ACPI table pointer (or NULL), not an NTSTATUS and out parameters.
+#pragma pack(push, 1)
+struct KvlAcpiHeader {
+    uint32_t Signature;
+    uint32_t Length;
+    uint8_t Revision;
+    uint8_t Checksum;
+    uint8_t OemId[6];
+    uint8_t OemTableId[8];
+    uint32_t OemRevision;
+    uint32_t CreatorId;
+    uint32_t CreatorRevision;
+};
 
-    if ((Signature & 0xFFFFFFFF) != 0x52414D44)   // 'DMAR'
-        return STATUS_NOT_FOUND;
+struct KvlDmarTable {
+    KvlAcpiHeader Header;
+    uint8_t HostAddressWidth;
+    uint8_t Flags;
+    uint8_t Reserved[10];
+};
 
-    auto HostOutTable = UcPtr((PVOID*)OutTable);
-    auto HostOutSize = (ULONG*)UcPtr((ULONG*)OutSize);
-    if (!HostOutTable || !HostOutSize) return STATUS_INVALID_PARAMETER;
+struct KvlDmarDrhd {
+    uint16_t Type;
+    uint16_t Length;
+    uint8_t Flags;
+    uint8_t Reserved;
+    uint16_t SegmentNumber;
+    uint64_t RegisterBaseAddress;
+};
 
-    // ACPI SDT header + one DRHD (Remapping Hardware Unit Declaration).
-    struct DmarHeader {
-        uint32_t Signature;
-        uint32_t Length;
-        uint8_t Revision;
-        uint8_t Checksum;
-        uint8_t OemId[6];
-        uint8_t OemTableId[8];
-        uint32_t OemRevision;
-        uint32_t CreatorId;
-        uint32_t CreatorRevision;
-    };
-    struct DrhdEntry {
-        uint16_t Type;
-        uint16_t Length;
-        uint8_t Flags;
-        uint8_t Reserved;
-        uint16_t SegmentNumber;
-        uint64_t RegisterBaseAddress;
-    };
+struct KvlMadtTable {
+    KvlAcpiHeader Header;
+    uint32_t LocalApicAddress;
+    uint32_t Flags;
+};
+#pragma pack(pop)
 
-    uint32_t TableSize = sizeof(DmarHeader) + sizeof(DrhdEntry);
-    uint8_t Table[sizeof(DmarHeader) + sizeof(DrhdEntry)] = { 0 };
-
-    auto* Hdr = (DmarHeader*)Table;
-    Hdr->Signature = 0x52414D44;   // "DMAR"
-    Hdr->Length = TableSize;
-    Hdr->Revision = 1;
-    memcpy(Hdr->OemId, "KEVLAR", 6);
-    memcpy(Hdr->OemTableId, "KEVLAR-IOMMU", 12);
-    Hdr->OemRevision = 1;
-    Hdr->CreatorId = 0x524C564B;   // "KVLAR"
-    Hdr->CreatorRevision = 1;
-
-    auto* Drhd = (DrhdEntry*)(Table + sizeof(DmarHeader));
-    Drhd->Type = 0;                  // DRHD
-    Drhd->Length = sizeof(DrhdEntry);
-    Drhd->Flags = 0;
-    Drhd->SegmentNumber = 0;
-    Drhd->RegisterBaseAddress = 0xFED90000;
-
+static void KvlFinalizeAcpiChecksum(uint8_t* Table, size_t Size) {
+    auto* Header = (KvlAcpiHeader*)Table;
+    Header->Checksum = 0;
     uint8_t Sum = 0;
-    for (uint32_t I = 0; I < TableSize; I++) Sum += Table[I];
-    Hdr->Checksum = (uint8_t)(0x100 - Sum);   // ACPI checksum: all bytes sum to zero
+    for (size_t I = 0; I < Size; I++) Sum = (uint8_t)(Sum + Table[I]);
+    Header->Checksum = (uint8_t)(0u - Sum);
+}
 
-    uint64_t TableUcAddr = UnicornMem::AllocateVariable(UnicornEmu::PrimaryEngine, TableSize, "DMAR");
-    if (!TableUcAddr) return STATUS_INSUFFICIENT_RESOURCES;
-    memcpy(UnicornMem::UcToHost(TableUcAddr), Table, TableSize);
+static uint64_t KvlCopyAcpiTableToGuest(const uint8_t* Table, size_t Size, const char* Name) {
+    if (!Table || Size < sizeof(KvlAcpiHeader) || Size > 0x100000)
+        return 0;
 
-    *HostOutTable = (PVOID)TableUcAddr;   // guest VA, mapped (was: host VA into guest memory)
-    *HostOutSize = TableSize;
-    return STATUS_SUCCESS;
+    uint64_t TableUcAddr = UnicornMem::AllocateVariable(
+        UnicornThread::GetCurrentEngine(), Size, Name);
+    void* HostTable = UnicornMem::UcToHost(TableUcAddr);
+    if (!TableUcAddr || !HostTable)
+        return 0;
+
+    memcpy(HostTable, Table, Size);
+    return TableUcAddr;
+}
+
+static bool KvlAcpiTableMatchesFilters(
+    const KvlAcpiHeader* Header, uint64_t OemId, uint64_t OemTableId) {
+    if (OemId) {
+        auto HostOemId = (const uint8_t*)UnicornMem::UcToHost(OemId);
+        if (!HostOemId || memcmp(Header->OemId, HostOemId, sizeof(Header->OemId)) != 0)
+            return false;
+    }
+    if (OemTableId) {
+        auto HostOemTableId = (const uint8_t*)UnicornMem::UcToHost(OemTableId);
+        if (!HostOemTableId || memcmp(Header->OemTableId, HostOemTableId, sizeof(Header->OemTableId)) != 0)
+            return false;
+    }
+    return true;
+}
+
+static uint64_t h_HalAcpiGetTableEx(
+    uint64_t Context, uint64_t Signature, uint64_t OemId, uint64_t OemTableId) {
+    uint32_t Sig = (uint32_t)Signature;
+    char SigText[5] = {
+        (char)(Sig & 0xFF), (char)((Sig >> 8) & 0xFF),
+        (char)((Sig >> 16) & 0xFF), (char)((Sig >> 24) & 0xFF), 0
+    };
+    Logger::Log(
+        "{GRY}\tHalAcpiGetTableEx: context=0x%llx sig=0x%08x (%s) oemId=0x%llx oemTableId=0x%llx{RESET}\n",
+        Context, Sig, SigText, OemId, OemTableId);
+
+    // Prefer the host's real ACPI table. This gives the guest the same table a
+    // native driver on this machine would receive.
+    constexpr uint32_t AcpiProvider = 0x41435049; // 'ACPI'
+    UINT HostSize = GetSystemFirmwareTable(AcpiProvider, Sig, nullptr, 0);
+    if (HostSize >= sizeof(KvlAcpiHeader) && HostSize <= 0x100000) {
+        std::vector<uint8_t> HostTable(HostSize);
+        UINT Written = GetSystemFirmwareTable(AcpiProvider, Sig, HostTable.data(), HostSize);
+        if (Written == HostSize) {
+            auto* Header = (const KvlAcpiHeader*)HostTable.data();
+            if (Header->Signature == Sig &&
+                Header->Length >= sizeof(KvlAcpiHeader) &&
+                Header->Length <= HostSize &&
+                KvlAcpiTableMatchesFilters(Header, OemId, OemTableId)) {
+                uint64_t Result = KvlCopyAcpiTableToGuest(
+                    HostTable.data(), Header->Length, SigText);
+                Logger::Log("{GRY}\tHalAcpiGetTableEx: host table -> 0x%llx (%u bytes){RESET}\n",
+                    Result, Header->Length);
+                return Result;
+            }
+        }
+    }
+
+    if (Sig == 0x52414D44) { // 'DMAR'
+        // The emulated PCI model advertises Intel VT-d, so provide a coherent
+        // DMAR table even when the host itself uses a different IOMMU format.
+        uint8_t Bytes[sizeof(KvlDmarTable) + sizeof(KvlDmarDrhd)] = {};
+        auto* Table = (KvlDmarTable*)Bytes;
+        Table->Header.Signature = Sig;
+        Table->Header.Length = sizeof(Bytes);
+        Table->Header.Revision = 1;
+        memcpy(Table->Header.OemId, "KEVLAR", 6);
+        memcpy(Table->Header.OemTableId, "KVLRIOMM", 8);
+        Table->Header.OemRevision = 1;
+        Table->Header.CreatorId = 0x524C564B; // 'KVLR'
+        Table->Header.CreatorRevision = 1;
+        Table->HostAddressWidth = 0x2F; // 48-bit physical addresses, encoded as N-1
+
+        auto* Drhd = (KvlDmarDrhd*)(Bytes + sizeof(KvlDmarTable));
+        Drhd->Type = 0;
+        Drhd->Length = sizeof(KvlDmarDrhd);
+        Drhd->Flags = 1; // INCLUDE_PCI_ALL
+        Drhd->SegmentNumber = 0;
+        Drhd->RegisterBaseAddress = 0xFED90000;
+        KvlFinalizeAcpiChecksum(Bytes, sizeof(Bytes));
+
+        if (!KvlAcpiTableMatchesFilters(&Table->Header, OemId, OemTableId))
+            return 0;
+        uint64_t Result = KvlCopyAcpiTableToGuest(Bytes, sizeof(Bytes), "DMAR");
+        Logger::Log("{GRY}\tHalAcpiGetTableEx: synthetic DMAR -> 0x%llx (%zu bytes){RESET}\n",
+            Result, sizeof(Bytes));
+        return Result;
+    }
+
+    if (Sig == 0x43495041) { // 'APIC'; fallback for hosts that deny firmware access
+        KvlMadtTable Table = {};
+        Table.Header.Signature = Sig;
+        Table.Header.Length = sizeof(Table);
+        Table.Header.Revision = 5;
+        memcpy(Table.Header.OemId, "KEVLAR", 6);
+        memcpy(Table.Header.OemTableId, "KVLRAPIC", 8);
+        Table.Header.OemRevision = 1;
+        Table.Header.CreatorId = 0x524C564B;
+        Table.Header.CreatorRevision = 1;
+        Table.LocalApicAddress = 0xFEE00000;
+        Table.Flags = 1; // dual 8259 PICs are present
+        KvlFinalizeAcpiChecksum((uint8_t*)&Table, sizeof(Table));
+
+        if (!KvlAcpiTableMatchesFilters(&Table.Header, OemId, OemTableId))
+            return 0;
+        uint64_t Result = KvlCopyAcpiTableToGuest((const uint8_t*)&Table, sizeof(Table), "APIC");
+        Logger::Log("{GRY}\tHalAcpiGetTableEx: synthetic APIC -> 0x%llx (%zu bytes){RESET}\n",
+            Result, sizeof(Table));
+        return Result;
+    }
+
+    // WAET and unknown/absent tables correctly return NULL. Returning an
+    // NTSTATUS here is what previously made the guest dereference C0000225.
+    Logger::Log("{GRY}\tHalAcpiGetTableEx: table absent -> NULL{RESET}\n");
+    return 0;
 }
 
 static uint64_t h_DbgSetDebugPrintCallback(uint64_t Callback, uint64_t Enable) {

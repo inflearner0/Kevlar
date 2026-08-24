@@ -27,6 +27,9 @@
 #define KVP_TAG_REQ 'qvKk'
 #define KVP_TAG_BUF 'bvKk'
 
+#define KVP_CONTROL_DEVICE_NAME   L"\\Device\\KevlarProxyCtl"
+#define KVP_CONTROL_SYMLINK_NAME  L"\\DosDevices\\Global\\KevlarProxyCtl"
+
 typedef struct _KVP_DEVICE_EXTENSION {
     ULONG DeviceIndex;
 } KVP_DEVICE_EXTENSION, *PKVP_DEVICE_EXTENSION;
@@ -68,6 +71,14 @@ typedef struct _KVP_PENDING_REQUEST {
     PVOID NeitherInputPool;      // METHOD_NEITHER only
 } KVP_PENDING_REQUEST, *PKVP_PENDING_REQUEST;
 
+// IoCreateDriver is exported by the kernel but is not declared by the public WDK
+// headers. Resolve it at runtime so the I/O manager, rather than this driver, builds
+// and initializes the backing DRIVER_OBJECT.
+typedef NTSTATUS (NTAPI *PKVP_IO_CREATE_DRIVER)(
+    PUNICODE_STRING DriverName,
+    PDRIVER_INITIALIZE InitializationFunction
+    );
+
 static PDRIVER_OBJECT g_DriverObject = NULL;
 static PDEVICE_OBJECT g_ControlDevice = NULL;
 static PFILE_OBJECT g_ControlOwner = NULL;
@@ -78,6 +89,7 @@ static volatile LONG64 g_NextRequestId = 0;
 static KVP_DEVICE_SLOT g_DeviceSlots[KVP_MAX_DEVICES];
 
 DRIVER_INITIALIZE DriverEntry;
+DRIVER_INITIALIZE KvpInitializeDriverObject;
 static VOID KvpUnload(PDRIVER_OBJECT DriverObject);
 
 static NTSTATUS KvpMajorCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp);
@@ -149,6 +161,27 @@ KvpFreeNeither(PMDL Mdl, PVOID InputPool)
 NTSTATUS
 DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
+    UNICODE_STRING RoutineName;
+    PKVP_IO_CREATE_DRIVER IoCreateDriverRoutine;
+
+    // The loader-supplied object is deliberately not used for dispatch or device
+    // ownership. IoCreateDriver supplies a genuine, fully initialized object to
+    // KvpInitializeDriverObject. Passing NULL gives that object a unique kernel name.
+    UNREFERENCED_PARAMETER(DriverObject);
+    UNREFERENCED_PARAMETER(RegistryPath);
+
+    RtlInitUnicodeString(&RoutineName, L"IoCreateDriver");
+    IoCreateDriverRoutine = (PKVP_IO_CREATE_DRIVER)
+        MmGetSystemRoutineAddress(&RoutineName);
+    if (IoCreateDriverRoutine == NULL)
+        return STATUS_PROCEDURE_NOT_FOUND;
+
+    return IoCreateDriverRoutine(NULL, KvpInitializeDriverObject);
+}
+
+NTSTATUS
+KvpInitializeDriverObject(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+{
     UNICODE_STRING DeviceName, SymLink, Sddl;
     NTSTATUS Status;
     ULONG I;
@@ -176,7 +209,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     // SYSTEM + Administrators only, single owner enforced in KvpControlCreate --
     // kevlar_proxy/README.md SS4.1/SS4.5.
-    RtlInitUnicodeString(&DeviceName, L"\\Device\\KevlarProxyCtl");
+    RtlInitUnicodeString(&DeviceName, KVP_CONTROL_DEVICE_NAME);
     RtlInitUnicodeString(&Sddl, L"D:P(A;;GA;;;BA)(A;;GA;;;SY)");
 
     Status = IoCreateDeviceSecure(
@@ -185,7 +218,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     if (!NT_SUCCESS(Status))
         return Status;
 
-    RtlInitUnicodeString(&SymLink, L"\\DosDevices\\KevlarProxyCtl");
+    RtlInitUnicodeString(&SymLink, KVP_CONTROL_SYMLINK_NAME);
     Status = IoCreateSymbolicLink(&SymLink, &DeviceName);
     if (!NT_SUCCESS(Status)) {
         IoDeleteDevice(g_ControlDevice);
@@ -208,7 +241,7 @@ KvpUnload(PDRIVER_OBJECT DriverObject)
     KvpTeardownAll();
 
     if (g_ControlDevice) {
-        RtlInitUnicodeString(&SymLink, L"\\DosDevices\\KevlarProxyCtl");
+        RtlInitUnicodeString(&SymLink, KVP_CONTROL_SYMLINK_NAME);
         IoDeleteSymbolicLink(&SymLink);
         IoDeleteDevice(g_ControlDevice);
         g_ControlDevice = NULL;

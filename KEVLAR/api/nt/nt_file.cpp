@@ -2,6 +2,53 @@
 #include "core/registry/virtual_fs.h"
 #include "core/object/handle_manager.h"
 #include "nt_memory.h"
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace {
+    std::mutex gFilePathLock;
+    std::unordered_map<uintptr_t, std::wstring> gFilePathByHandle;
+    std::unordered_set<uintptr_t> gCatRootEnumeratedHandles;
+
+    void TrackFilePath(HANDLE Handle, const wchar_t* Path) {
+        if (!Handle || Handle == INVALID_HANDLE_VALUE || !Path)
+            return;
+        std::lock_guard<std::mutex> Guard(gFilePathLock);
+        gFilePathByHandle[(uintptr_t)Handle] = Path;
+        gCatRootEnumeratedHandles.erase((uintptr_t)Handle);
+    }
+
+    std::wstring GetTrackedFilePath(HANDLE Handle) {
+        std::lock_guard<std::mutex> Guard(gFilePathLock);
+        auto It = gFilePathByHandle.find((uintptr_t)Handle);
+        return It == gFilePathByHandle.end() ? std::wstring() : It->second;
+    }
+
+    void ForgetFilePath(HANDLE Handle) {
+        std::lock_guard<std::mutex> Guard(gFilePathLock);
+        gFilePathByHandle.erase((uintptr_t)Handle);
+        gCatRootEnumeratedHandles.erase((uintptr_t)Handle);
+    }
+
+    bool IsCatRootPath(const std::wstring& Path) {
+        std::wstring Lower = Path;
+        for (auto& Ch : Lower)
+            Ch = (wchar_t)towlower(Ch);
+        return Lower.find(L"\\system32\\catroot\\") != std::wstring::npos;
+    }
+
+    bool CatRootEnumerationAlreadyServed(HANDLE Handle) {
+        std::lock_guard<std::mutex> Guard(gFilePathLock);
+        return gCatRootEnumeratedHandles.find((uintptr_t)Handle) !=
+            gCatRootEnumeratedHandles.end();
+    }
+
+    void MarkCatRootEnumerationServed(HANDLE Handle) {
+        std::lock_guard<std::mutex> Guard(gFilePathLock);
+        gCatRootEnumeratedHandles.insert((uintptr_t)Handle);
+    }
+}
 
 NTSTATUS h_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, OBJECT_ATTRIBUTES* ObjectAttributes, PVOID IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength) {
@@ -23,6 +70,7 @@ NTSTATUS h_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, OBJECT_AT
             HANDLE H = VirtualFs::CreateLocalFile(LocalPath, DesiredAccess, FileAttributes, ShareAccess, CreateDisposition, CreateOptions);
             if (H != INVALID_HANDLE_VALUE) {
                 *HostHandle = H;
+                TrackFilePath(H, PathStr);
                 if (HostIsb) {
                     auto Isb = (_IO_STATUS_BLOCK*)HostIsb;
                     Isb->Status = 0;
@@ -44,6 +92,8 @@ NTSTATUS h_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, OBJECT_AT
                 SafeAccess |= SYNCHRONIZE;
             auto Ret = __NtRoutine("NtCreateFile", HostHandle, SafeAccess, &LocalOa, HostIsb, AllocationSize, FileAttributes, ShareAccess,
                 CreateDisposition, SafeOptions, EaBuffer, EaLength);
+            if (Ret >= 0 && HostHandle)
+                TrackFilePath(*HostHandle, PathStr);
             Logger::Log("  {GRY}OS fallback return: {WHT}%08x{RESET}\n", Ret);
             return Ret;
         }
@@ -58,6 +108,8 @@ NTSTATUS h_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, OBJECT_AT
         SafeAccess |= SYNCHRONIZE;
     auto Ret = __NtRoutine("NtCreateFile", HostHandle, SafeAccess, &LocalOa, HostIsb, AllocationSize, FileAttributes, ShareAccess,
         CreateDisposition, SafeOptions, EaBuffer, EaLength);
+    if (Ret >= 0 && HostHandle)
+        TrackFilePath(*HostHandle, PathStr);
     Logger::Log("  {GRY}Return: {WHT}%08x{RESET}\n", Ret);
     return Ret;
 }
@@ -104,6 +156,7 @@ NTSTATUS h_ZwOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, OBJECT_ATTR
         HANDLE H = VirtualFs::CreateLocalFile(LocalPath, DesiredAccess, 0, ShareAccess, 1, OpenOptions);
         if (H != INVALID_HANDLE_VALUE) {
             *HostHandle = H;
+            TrackFilePath(H, PathStr);
             if (HostIsb) {
                 auto Isb = (_IO_STATUS_BLOCK*)HostIsb;
                 Isb->Status = 0;
@@ -124,6 +177,8 @@ NTSTATUS h_ZwOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, OBJECT_ATTR
         SafeAccess |= SYNCHRONIZE;
 
     auto Ret = __NtRoutine("NtOpenFile", HostHandle, SafeAccess, &LocalOa, HostIsb, ShareAccess, SafeOptions);
+    if (Ret >= 0 && HostHandle)
+        TrackFilePath(*HostHandle, PathStr);
     Logger::Log("{GRY}\tReturn: %08x{RESET}\n", Ret);
     return Ret;
 }
@@ -183,6 +238,7 @@ NTSTATUS h_ZwClose(HANDLE Handle) {
     Logger::Log("{CYN}\tClosing Kernel Handle : %llx{RESET}\n", Handle);
     if (!Handle)
         return STATUS_SUCCESS;
+    ForgetFilePath(Handle);
     if (VRegHandleManager::IsVRegHandle(Handle)) {
         VRegHandleManager::FreeHandle(Handle);
         return STATUS_SUCCESS;
@@ -235,8 +291,53 @@ NTSTATUS h_NtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutin
     Logger::Log("  {GRY}NtQueryDirectoryFile: handle=%p class=%u len=%u{RESET}\n",
         FileHandle, FileInformationClass, Length);
 
+    const bool IsBoundedCatRootQuery = FileInformationClass == 1 &&
+        !ReturnSingleEntry && IsCatRootPath(GetTrackedFilePath(FileHandle));
+
+    // Once a representative CatRoot batch has been returned for this handle,
+    // report end-of-directory.  Capping each native response is insufficient:
+    // the next call resumes at the following catalog and still walks thousands
+    // of files.
+    if (IsBoundedCatRootQuery && CatRootEnumerationAlreadyServed(FileHandle)) {
+        if (HostIsb) {
+            auto Isb = (_IO_STATUS_BLOCK*)HostIsb;
+            Isb->Status = STATUS_NO_MORE_FILES;
+            Isb->Information = 0;
+        }
+        Logger::Log("  {GRN}NtQueryDirectoryFile: CatRoot lifetime cap reached; returning STATUS_NO_MORE_FILES{RESET}\n");
+        return STATUS_NO_MORE_FILES;
+    }
+
     auto Ret = __NtRoutine("NtQueryDirectoryFile", FileHandle, (HANDLE)NULL, (PVOID)NULL, (PVOID)NULL,
         HostIsb, HostInfo, Length, FileInformationClass, ReturnSingleEntry, HostFileName, RestartScan);
+
+    // A single CatRoot directory response can contain thousands of catalog
+    // files.  EAC hashes each one under Unicorn, turning a boot-time check into
+    // many hours of emulation.  Keep a representative bounded prefix while
+    // preserving the native FILE_DIRECTORY_INFORMATION layout and status.
+    if (Ret >= 0 && HostIsb && HostInfo && IsBoundedCatRootQuery) {
+        constexpr ULONG MaxCatalogEntries = 24;
+        auto Isb = (_IO_STATUS_BLOCK*)HostIsb;
+        ULONG TotalBytes = (ULONG)Isb->Information;
+        ULONG Offset = 0;
+        ULONG Count = 0;
+        while (Offset + 64 <= TotalBytes && Offset + 64 <= Length) {
+            auto Entry = (uint8_t*)HostInfo + Offset;
+            ULONG Next = *(ULONG*)Entry;
+            ++Count;
+            if (Count == MaxCatalogEntries && Next != 0) {
+                *(ULONG*)Entry = 0;
+                Isb->Information = Offset + Next;
+                Logger::Log("  {GRN}NtQueryDirectoryFile: CatRoot response capped at %u entries (%llu bytes){RESET}\n",
+                    Count, (uint64_t)Isb->Information);
+                break;
+            }
+            if (Next == 0 || Next > TotalBytes - Offset)
+                break;
+            Offset += Next;
+        }
+        MarkCatRootEnumerationServed(FileHandle);
+    }
     return Ret;
 }
 

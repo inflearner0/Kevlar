@@ -213,6 +213,7 @@ void UnicornEmu::Hooks::OnSysModExec(uc_engine* Uc, uint64_t Addr, uint32_t Size
         if (RetVal >= 0x80000000ULL && RetVal <= 0xFFFFFFFFULL) {
             bool IsExpectedError = false;
             switch ((uint32_t)RetVal) {
+            case 0xC000000B: // STATUS_INVALID_CID during sparse PID/TID probing
             case 0xC0000004:
             case 0xC0000023:
             case 0xC0000225:

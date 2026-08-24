@@ -470,6 +470,61 @@ NTSTATUS h_NtQuerySystemInformation(uint32_t SystemInformationClass, uintptr_t S
         }
     };
 
+    if (SystemInformationClass == 0x05) {
+        // Do not leak the host process table into the guest.  Besides exposing
+        // KEVLAR/debugger processes, the hundreds of host threads made EAC's
+        // virtualized process scan take hours.  Present a small, coherent boot
+        // process set using the stable x64 SYSTEM_PROCESS_INFORMATION prefix.
+        constexpr ULONG RecordSize = 0x280;
+        struct ProcessDesc {
+            const wchar_t* Name;
+            uint64_t Pid;
+            uint64_t ParentPid;
+            uint32_t SessionId;
+        };
+        static const ProcessDesc Processes[] = {
+            { L"System",       4,   0, 0 },
+            { L"smss.exe",   500,  4, 0 },
+            { L"csrss.exe",  600, 500, 0 },
+            { L"wininit.exe",700, 500, 0 },
+            { L"services.exe",800,700, 0 },
+        };
+        constexpr ULONG ProcessCount = (ULONG)(sizeof(Processes) / sizeof(Processes[0]));
+        constexpr ULONG RequiredSize = RecordSize * ProcessCount;
+        WriteRetLen(RequiredSize);
+        if (SystemInformationLength < RequiredSize) {
+            Logger::Log("  {MAG}SystemProcessInformation synthetic required=0x%x callerLen=0x%x -> STATUS_INFO_LENGTH_MISMATCH{RESET}\n",
+                RequiredSize, SystemInformationLength);
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        uint8_t ProcessBuf[RequiredSize] = {};
+        for (ULONG Index = 0; Index < ProcessCount; ++Index) {
+            auto Record = ProcessBuf + Index * RecordSize;
+            const auto& Desc = Processes[Index];
+            const USHORT NameLength = (USHORT)(wcslen(Desc.Name) * sizeof(wchar_t));
+            const ULONG NameOffset = 0x260;
+
+            *(ULONG*)(Record + 0x00) = (Index + 1 < ProcessCount) ? RecordSize : 0;
+            *(ULONG*)(Record + 0x04) = 0; // no fabricated thread array
+            *(LONGLONG*)(Record + 0x20) = (LONGLONG)GetTickCount64() * 10000;
+            *(USHORT*)(Record + 0x38) = NameLength;
+            *(USHORT*)(Record + 0x3A) = NameLength + sizeof(wchar_t);
+            *(uint64_t*)(Record + 0x40) = SystemInformation + Index * RecordSize + NameOffset;
+            *(LONG*)(Record + 0x48) = 8;
+            *(uint64_t*)(Record + 0x50) = Desc.Pid;
+            *(uint64_t*)(Record + 0x58) = Desc.ParentPid;
+            *(ULONG*)(Record + 0x60) = (Desc.Pid == 4) ? 128 : 32;
+            *(ULONG*)(Record + 0x64) = Desc.SessionId;
+            memcpy(Record + NameOffset, Desc.Name, NameLength + sizeof(wchar_t));
+        }
+
+        WriteBuf(ProcessBuf, RequiredSize);
+        Logger::Log("  {GRN}SystemProcessInformation -> %u synthetic processes, 0x%x bytes{RESET}\n",
+            ProcessCount, RequiredSize);
+        return STATUS_SUCCESS;
+    }
+
     if (SystemInformationClass == 0x5A) {
         ULONG RequiredSize = 0x20;
         WriteRetLen(RequiredSize);

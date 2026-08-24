@@ -24,6 +24,26 @@ ULONG h_KeQueryTimeIncrement() {
     return 156250; //machine with no hv
 }
 
+namespace {
+    struct IpiBarrierAssist {
+        volatile LONG* ArrivalCount;
+        LONG LogicalProcessorCount;
+    };
+
+    void OnIpiBarrierAfterXadd(uc_engine*, uint64_t, uint32_t, void* UserData) {
+        auto Assist = (IpiBarrierAssist*)UserData;
+        if (!Assist || !Assist->ArrivalCount)
+            return;
+
+        // KeIpiGenericCall broadcasts concurrently.  A single representative
+        // Unicorn callback otherwise deadlocks in barriers that wait for a
+        // second CPU after `lock xadd [rcx], eax`.  Publish the synthetic CPU
+        // count after the callback has retained EAX=0 for the primary CPU, so
+        // its real payload still runs once and the rendezvous can complete.
+        InterlockedExchange(Assist->ArrivalCount, Assist->LogicalProcessorCount);
+    }
+}
+
 NTSTATUS h_KeDelayExecutionThread(char WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval) {
     DeliverPendingApcs();
 
@@ -103,7 +123,35 @@ ULONG_PTR h_KeIpiGenericCall(PVOID BroadcastFunction, ULONG_PTR Context) {
     uc_mem_write(Uc, Rsp, &RetAddr, 8);
     uc_reg_write(Uc, UC_X86_REG_RSP, &Rsp);
 
+    uc_hook BarrierHook = 0;
+    bool BarrierHookInstalled = false;
+    IpiBarrierAssist BarrierAssist = {};
+    uint8_t CallbackPrefix[64] = {};
+    if (Context && uc_mem_read(Uc, FuncAddr, CallbackPrefix, sizeof(CallbackPrefix)) == UC_ERR_OK) {
+        for (size_t Offset = 0; Offset + 4 <= sizeof(CallbackPrefix); ++Offset) {
+            if (CallbackPrefix[Offset] == 0xF0 && CallbackPrefix[Offset + 1] == 0x0F &&
+                CallbackPrefix[Offset + 2] == 0xC1 && CallbackPrefix[Offset + 3] == 0x01) {
+                auto HostContext = (volatile LONG*)UnicornMem::UcToHost(Context);
+                if (HostContext) {
+                    BarrierAssist.ArrivalCount = HostContext;
+                    BarrierAssist.LogicalProcessorCount = 16;
+                    const uint64_t AfterXadd = FuncAddr + Offset + 4;
+                    auto HookErr = uc_hook_add(Uc, &BarrierHook, UC_HOOK_CODE,
+                        (void*)OnIpiBarrierAfterXadd, &BarrierAssist, AfterXadd, AfterXadd);
+                    BarrierHookInstalled = HookErr == UC_ERR_OK;
+                    if (BarrierHookInstalled) {
+                        Logger::Log("{GRN}\tKeIpiGenericCall: assisted broadcast barrier at 0x%llx (16 synthetic CPUs){RESET}\n",
+                            AfterXadd);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     uc_err EmuErr = uc_emu_start(Uc, FuncAddr, SENTINEL_RET_ADDR, 0, 0);
+    if (BarrierHookInstalled)
+        uc_hook_del(Uc, BarrierHook);
 
     uint64_t Result = 0;
     uc_reg_read(Uc, UC_X86_REG_RAX, &Result);

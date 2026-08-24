@@ -15,74 +15,28 @@ PVOID h_PsGetProcessWow64Process(_EPROCESS* Process) {
     return *EprocWow64Process(HostProc);
 }
 
-static std::unordered_map<uint64_t, uint64_t> FakeThreadMap;
-static constexpr uint64_t THREAD_MAP_MISS = (uint64_t)-1;
-
 NTSTATUS h_PsLookupThreadByThreadId(HANDLE ThreadId, PVOID* Thread) {
     auto HostThread = UcPtr(Thread);
-
-    if (ThreadId == (HANDLE)4) {
-        *HostThread = (PVOID)ETHREAD_BASE_UC;
-        return 0;
-    }
-
     uint64_t Tid = (uint64_t)(uintptr_t)ThreadId;
 
-    {
-        std::lock_guard<std::mutex> Lock(FakeProcessLock);
-        auto It = FakeThreadMap.find(Tid);
-        if (It != FakeThreadMap.end()) {
-            if (It->second == THREAD_MAP_MISS) {
-                *HostThread = nullptr;
-                return (NTSTATUS)0xC000000B;
-            }
-            *HostThread = (PVOID)It->second;
-            return 0;
+    // Keep the guest kernel's thread namespace self-consistent. Host TIDs do not
+    // identify guest ETHREADs and must not be mirrored as PID 4 system threads.
+    if (Tid == 8) {
+        *HostThread = (PVOID)ETHREAD_BASE_UC;
+        return STATUS_SUCCESS;
+    }
+
+    std::lock_guard<std::mutex> Lock(UnicornThread::ThreadLock);
+    for (const auto& Entry : UnicornThread::ThreadMap) {
+        const auto* Ctx = Entry.second;
+        if (Ctx && Ctx->ThreadId == Tid) {
+            *HostThread = (PVOID)Ctx->EthreadUcAddr;
+            return STATUS_SUCCESS;
         }
     }
 
-    HANDLE OsHandle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)Tid);
-    if (!OsHandle && GetLastError() != ERROR_ACCESS_DENIED) {
-        std::lock_guard<std::mutex> Lock(FakeProcessLock);
-        FakeThreadMap[Tid] = THREAD_MAP_MISS;
-        *HostThread = nullptr;
-        return (NTSTATUS)0xC000000B;
-    }
-    if (OsHandle)
-        CloseHandle(OsHandle);
-
-    auto Uc = UnicornThread::GetCurrentEngine();
-    uint64_t UcAddr = UnicornMem::AllocateVariable(Uc, sizeof(_ETHREAD), "FakeETHREAD");
-    if (!UcAddr) {
-        *HostThread = nullptr;
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    auto HostEthread = (_ETHREAD*)UnicornMem::UcToHost(UcAddr);
-    memset(HostEthread, 0, sizeof(_ETHREAD));
-    EthreadCid(HostEthread)->UniqueProcess = (HANDLE)4;
-    EthreadCid(HostEthread)->UniqueThread = (HANDLE)(uintptr_t)Tid;
-    *(void**)((uint8_t*)HostEthread + ETHREAD_Tcb_Process) = (void*)EPROCESS_BASE_UC;
-    *(void**)((uint8_t*)HostEthread + ETHREAD_Tcb_ApcState_Process) = (void*)EPROCESS_BASE_UC;
-
-    uint64_t ThreadWlh = UcAddr + offsetof(_ETHREAD, Tcb.Header.WaitListHead);
-    HostEthread->Tcb.Header.WaitListHead.Flink = (PLIST_ENTRY)ThreadWlh;
-    HostEthread->Tcb.Header.WaitListHead.Blink = (PLIST_ENTRY)ThreadWlh;
-    uint64_t ApcList0 = UcAddr + offsetof(_ETHREAD, Tcb.ApcState.ApcListHead[0]);
-    HostEthread->Tcb.ApcState.ApcListHead[0].Flink = (PLIST_ENTRY)ApcList0;
-    HostEthread->Tcb.ApcState.ApcListHead[0].Blink = (PLIST_ENTRY)ApcList0;
-    uint64_t ApcList1 = UcAddr + offsetof(_ETHREAD, Tcb.ApcState.ApcListHead[1]);
-    HostEthread->Tcb.ApcState.ApcListHead[1].Flink = (PLIST_ENTRY)ApcList1;
-    HostEthread->Tcb.ApcState.ApcListHead[1].Blink = (PLIST_ENTRY)ApcList1;
-
-    {
-        std::lock_guard<std::mutex> Lock(FakeProcessLock);
-        FakeThreadMap[Tid] = UcAddr;
-    }
-
-    *HostThread = (PVOID)UcAddr;
-    Logger::Log("{GRY}\tPsLookupThreadByThreadId: TID %llu -> fake ETHREAD 0x%llx{RESET}\n", Tid, UcAddr);
-    return 0;
+    *HostThread = nullptr;
+    return (NTSTATUS)0xC000000B; // STATUS_INVALID_CID
 }
 
 HANDLE h_PsGetThreadId(_ETHREAD* Thread) {
@@ -193,29 +147,24 @@ bool h_PsIsProtectedProcess(_EPROCESS* process) {
 
 PACCESS_TOKEN h_PsReferencePrimaryToken(_EPROCESS* Process) {
     auto HostProc = UcPtr(Process);
-    _EX_FAST_REF* a1 = &HostProc->Token;
-    auto Value = a1->Value;
-    signed __int64 v3;
-    signed __int64 v4; // rdi
-    unsigned int v5; // r8d
-    unsigned __int64 v6; // rdi
+    if (!HostProc)
+        return nullptr;
 
-    if ((a1->Value & 0xF) != 0) {
-        do {
-            v3 = _InterlockedCompareExchange64((volatile long long*)a1, Value - 1, Value);
-            if (Value == v3)
-                break;
-            Value = v3;
-        } while ((v3 & 0xF) != 0);
+    auto Value = HostProc->Token.Value;
+    if ((Value & ~0xFULL) == 0) {
+        Value = TOKEN_BASE_UC | 0xFULL;
+        HostProc->Token.Value = Value;
     }
-    v4 = Value;
-    v5 = Value & 0xF;
-    v6 = v4 & 0xFFFFFFFFFFFFFFF0ui64;
-    if (v5 > 1)
-        a1 = (_EX_FAST_REF*)v6;
 
-    Logger::Log("{GRY}\tReturning Token : %llx{RESET}\n", (const void*)a1);
-    return a1;
+    // EX_FAST_REF's low nibble is a cached reference count.  The object
+    // address is always the masked value; the previous implementation returned
+    // the host address of the EPROCESS.Token field whenever the count was 0/1.
+    if ((Value & 0xFULL) > 1)
+        _InterlockedCompareExchange64((volatile long long*)&HostProc->Token.Value, Value - 1, Value);
+
+    auto Token = (PACCESS_TOKEN)(Value & ~0xFULL);
+    Logger::Log("{GRY}\tReturning guest Token : %llx{RESET}\n", (const void*)Token);
+    return Token;
 }
 
 NTSTATUS h_PsRemoveLoadImageNotifyRoutine(void* NotifyRoutine) { return STATUS_PROCEDURE_NOT_FOUND; }
@@ -272,12 +221,21 @@ HANDLE h_PsGetThreadProcess(_ETHREAD* Thread) {
 }
 
 char* h_PsGetProcessImageFileName(_EPROCESS* Process) {
-    static char FakeImageName[16] = "System";
+    if (!Process)
+        return nullptr;
+
     auto HostProc = UcPtr(Process);
-    if (*EprocUniqueProcessId(HostProc) == (HANDLE)4) {
-        return FakeImageName;
-    }
-    return FakeImageName;
+    if (!HostProc)
+        return nullptr;
+
+    // PsGetProcessImageFileName returns a pointer into the caller's EPROCESS.
+    // Never return a host pointer here: the return value is consumed by guest
+    // code and must remain in the Unicorn address space.
+    auto HostName = EprocImageFileName(HostProc);
+    uint64_t GuestName = (uint64_t)Process +
+        (uint64_t)(reinterpret_cast<uint8_t*>(HostName) - reinterpret_cast<uint8_t*>(HostProc));
+
+    return reinterpret_cast<char*>(GuestName);
 }
 
 BOOLEAN h_PsIsSystemThread(_ETHREAD* Thread) {
