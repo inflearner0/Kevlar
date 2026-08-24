@@ -350,6 +350,55 @@ ThreadContext* UnicornThread::CreateEx5(uint64_t StartRoutine, uint64_t Arg1, ui
     return CreateExImpl(StartRoutine, Arg1, Arg2, Arg3, Arg4, Arg5, true, OutHandle);
 }
 
+int UnicornThread::StopAll(DWORD TimeoutMs) {
+    std::vector<HANDLE> Handles;
+
+    {
+        std::lock_guard<std::mutex> Guard(ThreadLock);
+        for (auto& Entry : ThreadMap) {
+            ThreadContext* Ctx = Entry.second;
+            if (!Ctx || !Ctx->Running)
+                continue;
+
+            if (Ctx->Engine)
+                uc_emu_stop(Ctx->Engine);
+
+            // A thread parked in a wait needs the nudge as well, or it never gets
+            // back to the emulation loop to notice that it was stopped.
+            if (Ctx->WakeEvent)
+                SetEvent(Ctx->WakeEvent);
+
+            if (Ctx->HostThread)
+                Handles.push_back(Ctx->HostThread);
+        }
+    }
+
+    if (Handles.empty())
+        return 0;
+
+    DWORD Deadline = GetTickCount() + TimeoutMs;
+    for (size_t I = 0; I < Handles.size(); I += MAXIMUM_WAIT_OBJECTS) {
+        DWORD Count = (DWORD)((Handles.size() - I) < MAXIMUM_WAIT_OBJECTS
+            ? (Handles.size() - I) : MAXIMUM_WAIT_OBJECTS);
+
+        DWORD Now = GetTickCount();
+        DWORD Remaining = (Now < Deadline) ? (Deadline - Now) : 0;
+        WaitForMultipleObjects(Count, Handles.data() + I, TRUE, Remaining);
+    }
+
+    int StillRunning = 0;
+    {
+        std::lock_guard<std::mutex> Guard(ThreadLock);
+        for (auto& Entry : ThreadMap) {
+            ThreadContext* Ctx = Entry.second;
+            if (Ctx && Ctx->Running)
+                StillRunning++;
+        }
+    }
+
+    return StillRunning;
+}
+
 void UnicornThread::Terminate(ThreadContext* Ctx, NTSTATUS ExitStatus) {
     if (Ctx->Running) {
         uc_emu_stop(Ctx->Engine);

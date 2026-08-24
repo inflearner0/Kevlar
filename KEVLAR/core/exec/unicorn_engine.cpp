@@ -4,6 +4,7 @@
 #include <Logger/Logger.h>
 #include "core/exec/instruction_emulator.h"
 #include "core/memory/unicorn_memory.h"
+#include "core/process/unicorn_threading.h"
 #include "core/exception/seh_dispatch.h"
 #include "core/diagnostics/diag_center.h"
 #include <intrin.h>
@@ -165,6 +166,20 @@ bool UnicornEmu::Initialize() {
 }
 
 void UnicornEmu::Shutdown() {
+    // Threads the driver started with PsCreateSystemThread keep running on their
+    // own engines over the very buffers below, and host implementations they call
+    // reach into MappedRegions and the pool maps. Freeing all of that underneath
+    // them is a use-after-free that surfaces as a crash in an unrelated
+    // std::string destructor during CRT teardown. Stop them first, and if any
+    // refuses to stop, leak the mappings instead - the process is exiting anyway.
+    int StillRunning = UnicornThread::StopAll(2000);
+    if (StillRunning > 0) {
+        Logger::Log("{YEL}Shutdown: %d guest thread(s) still running - leaving host buffers mapped{RESET}\n",
+            StillRunning);
+        Logger::Log("{CYN}Unicorn engine shut down (partial){RESET}\n");
+        return;
+    }
+
     if (PrimaryEngine) {
         uc_close(PrimaryEngine);
         PrimaryEngine = nullptr;

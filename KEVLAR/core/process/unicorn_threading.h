@@ -57,6 +57,9 @@ ThreadContext* CreateEx(uint64_t StartRoutine, uint64_t Arg1, uint64_t Arg2, uin
 // CreateEx + a 5th __fastcall argument written to [RSP+0x28] (kernel APC KernelRoutine).
 ThreadContext* CreateEx5(uint64_t StartRoutine, uint64_t Arg1, uint64_t Arg2, uint64_t Arg3, uint64_t Arg4, uint64_t Arg5, PHANDLE OutHandle);
 void Terminate(ThreadContext* Ctx, NTSTATUS ExitStatus);
+// Ask every running guest thread to stop and wait up to TimeoutMs in total.
+// Returns how many were still running when the wait expired.
+int StopAll(DWORD TimeoutMs);
 ThreadContext* GetCurrent();
 _ETHREAD* GetCurrentEthread();
 uc_engine* GetCurrentEngine();
