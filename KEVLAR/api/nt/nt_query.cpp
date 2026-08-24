@@ -688,10 +688,39 @@ NTSTATUS h_NtQuerySystemInformation(uint32_t SystemInformationClass, uintptr_t S
     memset(ApiBuf, 0, ApiBufSize);
 
     ULONG ApiRetLen = 0;
-    NTSTATUS x = SafeNtQuerySystemInformationLocalBuf(SystemInformationClass, ApiBufSize, &ApiRetLen, ApiBuf, ApiBufSize);
 
-    Logger::Log("  {YEL}NtQuerySystemInformation class={WHT}0x%x {YEL}(%s) {YEL}bufLen={WHT}0x%x {YEL}apiBufSize={WHT}0x%x {YEL}status={WHT}0x%08x {YEL}apiRetLen={WHT}0x%x {YEL}caller=drv+0x%llx{RESET}\n",
-        SystemInformationClass, ClassName, SystemInformationLength, ApiBufSize, x, ApiRetLen, CallerRva);
+    // Fixed-size classes - SystemBasicInformation is the one drivers hit first -
+    // require SystemInformationLength to match the structure exactly, so handing
+    // the API our oversized scratch size fails every one of them with
+    // STATUS_INFO_LENGTH_MISMATCH no matter how big the caller's buffer was. Ask
+    // with the length the guest asked for and fall back to whatever size the API
+    // reports it needs. The guest-visible length checks further down are
+    // unaffected: a short caller buffer still gets INFO_LENGTH_MISMATCH and the
+    // required size, so the two-phase size probe keeps working.
+    ULONG ApiQueryLen = SystemInformationLength ? SystemInformationLength : ApiBufSize;
+    NTSTATUS x = SafeNtQuerySystemInformationLocalBuf(SystemInformationClass, ApiQueryLen, &ApiRetLen, ApiBuf, ApiBufSize);
+
+    bool LengthRejected = (x == STATUS_INFO_LENGTH_MISMATCH || x == STATUS_BUFFER_OVERFLOW ||
+        x == (NTSTATUS)0xC0000023 /* STATUS_BUFFER_TOO_SMALL */);
+
+    if (LengthRejected && ApiRetLen && ApiRetLen != ApiQueryLen) {
+        if (ApiRetLen > ApiBufSize) {
+            uint8_t* Grown = (uint8_t*)realloc(ApiBuf, ApiRetLen);
+            if (!Grown) {
+                free(ApiBuf);
+                return STATUS_UNSUCCESSFUL;
+            }
+            ApiBuf = Grown;
+            ApiBufSize = ApiRetLen;
+        }
+
+        memset(ApiBuf, 0, ApiBufSize);
+        ApiQueryLen = ApiRetLen;
+        x = SafeNtQuerySystemInformationLocalBuf(SystemInformationClass, ApiQueryLen, &ApiRetLen, ApiBuf, ApiBufSize);
+    }
+
+    Logger::Log("  {YEL}NtQuerySystemInformation class={WHT}0x%x {YEL}(%s) {YEL}bufLen={WHT}0x%x {YEL}apiQueryLen={WHT}0x%x {YEL}status={WHT}0x%08x {YEL}apiRetLen={WHT}0x%x {YEL}caller=drv+0x%llx{RESET}\n",
+        SystemInformationClass, ClassName, SystemInformationLength, ApiQueryLen, x, ApiRetLen, CallerRva);
 
     WriteRetLen(ApiRetLen);
 
