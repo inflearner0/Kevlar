@@ -891,15 +891,19 @@ void UnicornEmu::DumpBlockProfile(const char* Reason) {
 // A UC_HOOK_CODE spanning the whole driver range fires for every instruction the
 // guest executes and stops Unicorn chaining basic blocks, which on virtualised
 // code costs far more than the handful of MSR accesses it exists to catch. The
-// rdmsr/wrmsr encodings are two bytes, so find the pages that actually contain
-// them and hook only those - on a 13MB virtualised driver that is ~7% of the
-// executable pages.
+// A raw search for the two-byte rdmsr/wrmsr encodings still produces many false
+// positives in virtualised code and makes every instruction on those hot pages
+// take the code-hook helper. Decode executable sections linearly and hook only
+// the addresses that decode as actual MSR instructions.
 //
-// ponytail: the scan runs once, over the image as mapped. Code decrypted into
-// pages that held no 0F 30 / 0F 32 at scan time is not intercepted; extend this
-// with a write-triggered rescan when a driver is observed doing that.
+// The decode runs once over the mapped image. Code generated or decrypted after
+// this point needs a write-triggered rescan before its MSR instructions can be
+// intercepted.
 static uc_hook gMsrWideHook = 0;
 static uc_engine* gMsrWideEngine = nullptr;
+static uint64_t gMsrRangeImageBase = 0;
+static uint64_t gMsrRangeImageSize = 0;
+static std::vector<std::pair<uint64_t, uint64_t>> gMsrRanges;
 
 void UnicornEmu::InstallMsrIntercept(uc_engine* Uc) {
     uint64_t ImageBase = 0;
@@ -938,39 +942,76 @@ void UnicornEmu::InstallMsrIntercept(uc_engine* Uc) {
         gMsrWideEngine = nullptr;
     }
 
-    std::vector<std::pair<uint64_t, uint64_t>> Ranges;
-    for (uint64_t Offset = 0; Offset + 1 < ImageSize; Offset++) {
-        if (ImageHost[Offset] != 0x0F)
-            continue;
-        if (ImageHost[Offset + 1] != 0x30 && ImageHost[Offset + 1] != 0x32)
-            continue;
+    // The primary engine builds this once after image mapping. Worker engines are
+    // created later and can reuse it instead of decoding the image for every
+    // PsCreateSystemThread call.
+    if (gMsrRangeImageBase != ImageBase || gMsrRangeImageSize != ImageSize) {
+        gMsrRanges.clear();
 
-        uint64_t PageStart = ImageBase + (Offset & ~0xFFFULL);
-        uint64_t PageEnd = PageStart + 0x1000;
+        const IMAGE_DOS_HEADER* Dos = ImageSize >= sizeof(IMAGE_DOS_HEADER)
+            ? reinterpret_cast<const IMAGE_DOS_HEADER*>(ImageHost) : nullptr;
+        const IMAGE_NT_HEADERS64* Nt = nullptr;
+        if (Dos && Dos->e_magic == IMAGE_DOS_SIGNATURE && Dos->e_lfanew > 0 &&
+            (uint64_t)Dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) <= ImageSize) {
+            Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(ImageHost + Dos->e_lfanew);
+            if (Nt->Signature != IMAGE_NT_SIGNATURE || Nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+                Nt = nullptr;
+        }
 
-        // An encoding can carry prefixes, so include the tail of the page before it.
-        if (PageStart > ImageBase)
-            PageStart -= 0x10;
+        if (Nt) {
+            const IMAGE_SECTION_HEADER* Sections = IMAGE_FIRST_SECTION(Nt);
+            uint64_t SectionTableOffset = reinterpret_cast<const uint8_t*>(Sections) - ImageHost;
+            uint64_t SectionTableSize = (uint64_t)Nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
+            if (SectionTableOffset + SectionTableSize <= ImageSize) {
+                for (uint16_t Index = 0; Index < Nt->FileHeader.NumberOfSections; Index++) {
+                    const IMAGE_SECTION_HEADER& Section = Sections[Index];
+                    if (!(Section.Characteristics & IMAGE_SCN_MEM_EXECUTE) || Section.VirtualAddress >= ImageSize)
+                        continue;
 
-        if (!Ranges.empty() && Ranges.back().second >= PageStart)
-            Ranges.back().second = PageEnd;
-        else
-            Ranges.push_back({ PageStart, PageEnd });
+                    uint64_t SectionSize = std::max<uint64_t>(Section.Misc.VirtualSize, Section.SizeOfRawData);
+                    SectionSize = std::min<uint64_t>(SectionSize, ImageSize - Section.VirtualAddress);
+                    const uint8_t* Code = ImageHost + Section.VirtualAddress;
+
+                    for (uint64_t Offset = 0; Offset < SectionSize;) {
+                        ZydisDecodedInstruction Instr;
+                        ZydisDecodedOperand Operands[ZYDIS_MAX_OPERAND_COUNT];
+                        size_t Remaining = (size_t)std::min<uint64_t>(ZYDIS_MAX_INSTRUCTION_LENGTH, SectionSize - Offset);
+                        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&UnicornEmu::Decoder, Code + Offset,
+                                Remaining, &Instr, Operands)) || !Instr.length) {
+                            Offset++;
+                            continue;
+                        }
+
+                        if (Instr.mnemonic == ZYDIS_MNEMONIC_RDMSR || Instr.mnemonic == ZYDIS_MNEMONIC_WRMSR) {
+                            uint64_t Begin = ImageBase + Section.VirtualAddress + Offset;
+                            uint64_t End = Begin + Instr.length;
+                            if (!gMsrRanges.empty() && gMsrRanges.back().second == Begin)
+                                gMsrRanges.back().second = End;
+                            else
+                                gMsrRanges.push_back({ Begin, End });
+                        }
+                        Offset += Instr.length;
+                    }
+                }
+            }
+        }
+        gMsrRangeImageBase = ImageBase;
+        gMsrRangeImageSize = ImageSize;
     }
 
     int Installed = 0;
-    for (auto& Range : Ranges) {
+    for (auto& Range : gMsrRanges) {
         if (uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)Hooks::OnMsrFallback, nullptr,
                 Range.first, Range.second - 1) == UC_ERR_OK)
             Installed++;
     }
 
     uint64_t Covered = 0;
-    for (auto& Range : Ranges)
+    for (auto& Range : gMsrRanges)
         Covered += Range.second - Range.first;
 
-    Logger::Log("{GRN}MSR intercept: %d ranges covering %llu KB of %llu KB image (rdmsr=%d wrmsr=%d){RESET}\n",
-        Installed, Covered / 1024, ImageSize / 1024,
+    Logger::Log("{GRN}MSR intercept: %d decoded ranges covering %llu bytes of %llu KB image (rdmsr=%d wrmsr=%d){RESET}\n",
+        Installed, Covered, ImageSize / 1024,
         UnicornEmu::RdmsrInsnHookSupported ? 1 : 0,
         UnicornEmu::WrmsrInsnHookSupported ? 1 : 0);
 }

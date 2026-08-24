@@ -321,13 +321,10 @@ uc_engine* UnicornEmu::CreateEngine() {
         }
 
         if (MsrCodeInterceptEnabled) {
-            uc_err MsrHookErr = uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)Hooks::OnMsrFallback, nullptr,
-                DRIVER_BASE_UC, DRIVER_BASE_UC + 0x10000000ULL - 1);
-            if (MsrHookErr == UC_ERR_OK) {
-                Logger::Log("{GRN}CreateEngine: MSR fallback hook active for driver range{RESET}\n");
-            } else {
-                Logger::Log("{RED}CreateEngine: MSR fallback hook failed: %s{RESET}\n", uc_strerror(MsrHookErr));
-            }
+            // The driver is already mapped when worker engines are created. Reuse
+            // the narrowed MSR ranges instead of putting the old 256 MB code hook
+            // back on every guest thread (which disables TB chaining everywhere).
+            InstallMsrIntercept(Uc);
         }
 
         if (!MappedSysMods.empty()) {
@@ -587,4 +584,3 @@ void UnicornEmu::SetupMsrs(uc_engine* Uc) {
         }
     }
 }
-
