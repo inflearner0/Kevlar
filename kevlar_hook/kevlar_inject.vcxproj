@@ -37,8 +37,8 @@
   </ImportGroup>
   <PropertyGroup>
     <TargetName>kevlar_inject</TargetName>
-    <OutDir>$(SolutionDir)builds\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)builds\obj\$(Configuration)\$(ProjectName)\</IntDir>
+    <OutDir>$(ProjectDir)builds\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)builds\obj\$(Configuration)\$(ProjectName)\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>

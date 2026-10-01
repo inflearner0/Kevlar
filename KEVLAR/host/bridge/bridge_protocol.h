@@ -1,6 +1,6 @@
 #pragma once
 
-// Wire protocol for the Phase 1 usermode bridge (kevlar_proxy/README.md SS3).
+// Wire protocol for the Phase 1 usermode bridge (docs/bridge.md SS3).
 // One message-mode named-pipe write == one request; one write == one response.
 // Fixed-size headers below are read/written as raw bytes (no marshalling library),
 // so keep them POD and explicitly packed.
@@ -13,9 +13,23 @@ namespace Bridge {
 constexpr uint32_t kMagic = 0x4B564C42;
 constexpr uint16_t kVersion = 1;
 
-// Cap on InLen/OutLen (kevlar_proxy/README.md SS3.4): bounds guest-side allocation
+// Cap on InLen/OutLen (docs/bridge.md SS3.4): bounds guest-side allocation
 // a client can trigger per request.
 constexpr uint32_t kMaxPayload = 1 * 1024 * 1024;
+
+// The pipe name is a constant both ends compile in, so a run lines up with no
+// configuration at all. It used to be derived -- the server from the .sys filename, the
+// hook from whatever service name the client happened to pass to CreateService -- which
+// meant two unrelated strings had to coincide for anything to connect, and a client that
+// installed the driver under a different service name silently never found the bridge.
+// The device name is what identifies the driver; the transport does not need to.
+//
+// --serve=<name> and KEVLAR_HOOK_PIPE still override it, for running several emulators
+// side by side.
+constexpr char kPipePrefixA[] = "\\\\.\\pipe\\kevlar-";
+constexpr wchar_t kPipePrefixW[] = L"\\\\.\\pipe\\kevlar-";
+constexpr char kDefaultChannelA[] = "bridge";
+constexpr wchar_t kDefaultPipeNameW[] = L"\\\\.\\pipe\\kevlar-bridge";
 
 enum class Opcode : uint16_t {
     Enum = 1,   // -> device list, no request payload

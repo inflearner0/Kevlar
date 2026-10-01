@@ -51,11 +51,39 @@ static uint64_t ComputeEffectiveAddress(uc_engine* Uc, ZydisDecodedOperand* Op, 
     return BaseVal + IndexVal * Op->mem.scale + (uint64_t)Disp;
 }
 
+// Driver image mapping, resolved once when the hook is installed. This hook is
+// UC_HOOK_CODE over the whole image, so it runs on every instruction the driver
+// executes: it must not call back into Unicorn, and it must not read off the end of
+// the mapping. Doing both is what crashed a 12.5 MB target deterministically --
+// uc_mem_read of a fixed 16 bytes near the image edge re-entered the address-space
+// translation path from inside the hook and blew a stack cookie
+// (FAST_FAIL_STACK_COOKIE_CHECK_FAILURE). A small test driver never reaches its own
+// edge, which is why only a real target found it.
+struct SseAlignRegion {
+    uint64_t Base;
+    const uint8_t* Host;
+    uint64_t Size;
+};
+static SseAlignRegion gSseAlignRegion = {};
+
 void UnicornEmu::Hooks::OnSseAlignCheck(uc_engine* Uc, uint64_t Addr, uint32_t Size, void* UserData) {
     if (SseFault.Active) return;
 
+    auto* Region = (const SseAlignRegion*)UserData;
+    if (!Region || !Region->Host)
+        return;
+    if (Addr < Region->Base || Addr >= Region->Base + Region->Size)
+        return;
+
+    // Never fetch past the end of the image: clamp to what is actually mapped.
+    uint64_t Offset = Addr - Region->Base;
+    uint64_t Available = Region->Size - Offset;
+    uint32_t Want = (Size && Size < 16) ? Size : 16;
+    if (Want > Available) Want = (uint32_t)Available;
+    if (Want == 0) return;
+
     uint8_t Code[16] = {};
-    uc_mem_read(Uc, Addr, Code, (Size < 16) ? Size : 16);
+    memcpy(Code, Region->Host + Offset, Want);
 
     bool MaybeSse = false;
     if (Code[0] == 0x0F && (Code[1] == 0x28 || Code[1] == 0x29 || Code[1] == 0x2B)) MaybeSse = true;
@@ -69,7 +97,9 @@ void UnicornEmu::Hooks::OnSseAlignCheck(uc_engine* Uc, uint64_t Addr, uint32_t S
 
     ZydisDecodedInstruction Instr;
     ZydisDecodedOperand Operands[ZYDIS_MAX_OPERAND_COUNT];
-    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&UnicornEmu::Decoder, Code, 16, &Instr, Operands)))
+    // Decode only what was actually fetched, so a short read at the image edge cannot
+    // have its zero padding decoded as though it were instruction bytes.
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&UnicornEmu::Decoder, Code, Want, &Instr, Operands)))
         return;
 
     bool RequiresAlignment = false;
@@ -198,11 +228,30 @@ void UnicornEmu::Hooks::OnVmExit(uc_engine* Uc, uint64_t Addr, uint32_t Size, vo
 }
 
 void UnicornEmu::InstallSseAlignCheck(uc_engine* Uc, uint64_t DriverBase, uint64_t DriverSize) {
+    uint64_t RegionBase = 0, RegionSize = 0;
+    void* RegionHost = nullptr;
+    if (!UnicornMem::FindAllocation(DriverBase, RegionBase, RegionHost, RegionSize) || !RegionHost) {
+        Logger::Log("{YEL}SSE alignment check not installed: no tracked mapping at 0x%llx{RESET}\n",
+            DriverBase);
+        return;
+    }
+
+    // Every engine shares the one host buffer the driver image was mapped into, so a
+    // single resolved region serves all of them.
+    gSseAlignRegion.Base = RegionBase;
+    gSseAlignRegion.Host = (const uint8_t*)RegionHost;
+    gSseAlignRegion.Size = RegionSize;
+
+    // Bound the hook to the image that is actually mapped. Callers pass a generous
+    // nominal size (256 MB), which used to arm the hook over addresses with no backing
+    // mapping at all.
+    uint64_t Span = (DriverSize && DriverSize < RegionSize) ? DriverSize : RegionSize;
+
     uc_hook Hh;
-    uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)Hooks::OnSseAlignCheck, nullptr,
-        DriverBase, DriverBase + DriverSize - 1);
-    Logger::Log("{GRN}SSE alignment check installed: 0x%llx - 0x%llx{RESET}\n",
-        DriverBase, DriverBase + DriverSize - 1);
+    uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)Hooks::OnSseAlignCheck, &gSseAlignRegion,
+        RegionBase, RegionBase + Span - 1);
+    Logger::Log("{GRN}SSE alignment check installed: 0x%llx - 0x%llx (mapped image 0x%llx bytes){RESET}\n",
+        RegionBase, RegionBase + Span - 1, RegionSize);
 }
 
 static int FocusedTraceCount = 0;

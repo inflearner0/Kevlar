@@ -9,7 +9,7 @@
 namespace IoManager {
 
 // Serializes every Dispatch*/AllocateFileObject call across every host-side relay
-// (KEVLAR/host/bridge/bridge_server.cpp, proxy_relay.cpp): UnicornMem::AllocateVariable
+// (KEVLAR/host/bridge/bridge_server.cpp): UnicornMem::AllocateVariable
 // and the shared UC memory are not safe under concurrent dispatch threads, and this
 // is the one lock all relays must share so they can't race each other either.
 extern std::mutex DispatchMutex;
@@ -41,7 +41,7 @@ struct DispatchResult {
 // RequestorMode: 0 = KernelMode, 1 = UserMode (written to IRP->RequestorMode).
 // Buffers for these dispatches come from AllocateVariable in the kernel-range UC
 // pool, so passing UserMode here is only safe against a driver that never inspects
-// the address range itself (see kevlar_proxy/README.md SS3.5). Callers relaying a
+// the address range itself (see docs/bridge.md SS3.5). Callers relaying a
 // real usermode request should still pass KernelMode unless/until a usermode-range
 // allocator backs these buffers.
 DispatchResult DispatchCreate(uint64_t DeviceObjUcAddr, uint64_t FileObjUcAddr, CHAR RequestorMode = 0);

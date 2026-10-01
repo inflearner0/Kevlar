@@ -36,22 +36,57 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup>
-    <TargetName>kevlar_hook</TargetName>
-    <OutDir>$(SolutionDir)builds\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)builds\obj\$(Configuration)\$(ProjectName)\</IntDir>
+    <TargetName>VERSION</TargetName>
+    <OutDir>$(ProjectDir)builds\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)builds\obj\$(Configuration)\$(ProjectName)\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\extern\Zydis\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\vcpkg_installed\x64-windows-static\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Zydis.lib;Zycore.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ModuleDefinitionFile>exports.def</ModuleDefinitionFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <!-- vcpkg's x64-windows-static Zydis is built against the static CRT, and an injected
+       DLL should not depend on a redistributable being present in the target anyway. -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="hook.cpp" />
+    <ClCompile Include="bridge_client.cpp" />
+    <ClCompile Include="device_hooks.cpp" />
+    <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="hook_engine.cpp" />
+    <ClCompile Include="kevlar_hook.cpp" />
+    <ClCompile Include="process_hooks.cpp" />
+    <ClCompile Include="service_hooks.cpp" />
+    <ClCompile Include="version_exports.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\KEVLAR\host\bridge\bridge_protocol.h" />
+    <ClInclude Include="bridge_client.h" />
+    <ClInclude Include="device_hooks.h" />
+    <ClInclude Include="hook_engine.h" />
+    <ClInclude Include="kevlar_hook.h" />
+    <ClInclude Include="process_hooks.h" />
+    <ClInclude Include="reentry.h" />
+    <ClInclude Include="service_hooks.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="exports.def" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

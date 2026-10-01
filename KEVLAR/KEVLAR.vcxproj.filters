@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="core">
@@ -141,6 +141,9 @@
     <ClCompile Include="core\diagnostics\diag_center.cpp">
       <Filter>core\diagnostics</Filter>
     </ClCompile>
+    <ClCompile Include="core\diagnostics\vm_lift.cpp">
+      <Filter>core\diagnostics</Filter>
+    </ClCompile>
     <ClCompile Include="core\io\io_manager.cpp">
       <Filter>core\io</Filter>
     </ClCompile>
@@ -264,9 +267,6 @@
     <ClCompile Include="host\bridge\bridge_server.cpp">
       <Filter>host\bridge</Filter>
     </ClCompile>
-    <ClCompile Include="host\bridge\proxy_relay.cpp">
-      <Filter>host\bridge</Filter>
-    </ClCompile>
     <ClCompile Include="host\providers\provider.cpp">
       <Filter>host\providers</Filter>
     </ClCompile>
@@ -297,6 +297,9 @@
       <Filter>core\exception</Filter>
     </ClInclude>
     <ClInclude Include="core\diagnostics\diag_center.h">
+      <Filter>core\diagnostics</Filter>
+    </ClInclude>
+    <ClInclude Include="core\diagnostics\vm_lift.h">
       <Filter>core\diagnostics</Filter>
     </ClInclude>
     <ClInclude Include="core\io\io_manager.h">
@@ -435,12 +438,6 @@
       <Filter>host\bridge</Filter>
     </ClInclude>
     <ClInclude Include="host\bridge\bridge_server.h">
-      <Filter>host\bridge</Filter>
-    </ClInclude>
-    <ClInclude Include="host\bridge\proxy_relay.h">
-      <Filter>host\bridge</Filter>
-    </ClInclude>
-    <ClInclude Include="..\kevlar_proxy\kvp_protocol.h">
       <Filter>host\bridge</Filter>
     </ClInclude>
     <ClInclude Include="host\providers\provider.h">

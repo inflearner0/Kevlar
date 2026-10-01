@@ -76,14 +76,14 @@
     <OutDir>..\builds\Debug\</OutDir>
     <IntDir>..\builds\$(Platform)\$(Configuration)\</IntDir>
     <LibraryPath>$(LibraryPath)</LibraryPath>
-    <IncludePath>..\libs;..\kevlar_proxy;..\vcpkg_installed\x64-windows-static\include;$(IncludePath)</IncludePath>
+    <IncludePath>..\libs;..\vcpkg_installed\x64-windows-static\include;$(IncludePath)</IncludePath>
     <LibraryPath>..\vcpkg_installed\x64-windows-static\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>..\builds\Release\</OutDir>
     <IntDir>..\builds\$(Platform)\$(Configuration)\</IntDir>
     <LibraryPath>..\vcpkg_installed\x64-windows-static\lib;$(LibraryPath)</LibraryPath>
-    <IncludePath>..\libs;..\kevlar_proxy;..\vcpkg_installed\x64-windows-static\include;$(IncludePath)</IncludePath>
+    <IncludePath>..\libs;..\vcpkg_installed\x64-windows-static\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <VcpkgUseStatic>true</VcpkgUseStatic>
@@ -130,7 +130,7 @@
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <BufferSecurityCheck>true</BufferSecurityCheck>
-      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;..\kevlar_proxy;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -164,7 +164,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <GuardEHContMetadata>false</GuardEHContMetadata>
       <StructMemberAlignment>16Bytes</StructMemberAlignment>
-      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;..\kevlar_proxy;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\extern\Zydis\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -194,6 +194,7 @@
     <ClCompile Include="core\exec\insn_avx_ext.cpp" />
     <ClCompile Include="core\exception\seh_dispatch.cpp" />
     <ClCompile Include="core\diagnostics\diag_center.cpp" />
+    <ClCompile Include="core\diagnostics\vm_lift.cpp" />
     <ClCompile Include="core\io\io_manager.cpp" />
     <ClCompile Include="core\io\irp_ioctl.cpp" />
     <ClCompile Include="core\io\irp_readwrite.cpp" />
@@ -235,7 +236,6 @@
     <ClCompile Include="api\cng\cng.cpp" />
     <ClCompile Include="host\main\kevlar.cpp" />
     <ClCompile Include="host\bridge\bridge_server.cpp" />
-    <ClCompile Include="host\bridge\proxy_relay.cpp" />
     <ClCompile Include="host\providers\provider.cpp" />
     <ClCompile Include="host\providers\ntoskrnl_provider.cpp" />
     <ClCompile Include="host\providers\static_export_provider.cpp" />
@@ -250,6 +250,7 @@
     <ClInclude Include="core\exec\cpu_profile.h" />
     <ClInclude Include="core\exception\seh_dispatch.h" />
     <ClInclude Include="core\diagnostics\diag_center.h" />
+    <ClInclude Include="core\diagnostics\vm_lift.h" />
     <ClInclude Include="core\io\io_manager.h" />
     <ClInclude Include="core\io\irp_dispatch.h" />
     <ClInclude Include="core\loader\environment.h" />
@@ -296,8 +297,6 @@
     <ClInclude Include="host\config\config.h" />
     <ClInclude Include="host\bridge\bridge_protocol.h" />
     <ClInclude Include="host\bridge\bridge_server.h" />
-    <ClInclude Include="host\bridge\proxy_relay.h" />
-    <ClInclude Include="..\kevlar_proxy\kvp_protocol.h" />
     <ClInclude Include="host\providers\provider.h" />
     <ClInclude Include="host\providers\ntoskrnl_provider.h" />
     <ClInclude Include="host\providers\static_export_provider.h" />

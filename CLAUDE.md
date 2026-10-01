@@ -17,17 +17,25 @@ user-facing behavior, flags and the roadmap; this file covers the internals.
 
 .\tests\smoke.ps1            # build + generate a minimal .sys + run + assert + --selftest
 .\tests\smoke.ps1 -SkipBuild # reuse the existing build (the fast inner loop)
-
+.\tests\bridge_smoke.ps1     # end-to-end: real .sys in the emulator answering a real client
+.\tests\bridge_smoke.ps1 -SkipBuild -KeepLogs   # reuse the build; keep both logs for triage
 .\builds\Release\KEVLAR.exe --selftest              # IRQL/APC/DPC/timer self-test only, no driver
 .\builds\Release\KEVLAR.exe path\to\drv.sys --diag --no-pause
 .\tools\pdb_layout.ps1                              # regenerate generated\kernel_layout.h from the ntoskrnl PDB
-.\kevlar_proxy\build_proxy.ps1                      # kevlarproxy.sys (WDK; deliberately outside KEVLAR.sln)
+.\kevlar_hook\build_hook.ps1                        # kevlar_hook.dll + kevlar_inject.exe (outside KEVLAR.sln)
 ```
 
-There is no unit-test framework. The two automated checks are `tests\smoke.ps1` (PE mapping +
-emulator init end-to-end) and `--selftest` (IRQL/APC/DPC/timer semantics, implemented in
-`host/main/kevlar.cpp`). Both assert on log text: changing a line that `smoke.ps1` greps for
-breaks the test.
+There is no unit-test framework. The three automated checks are `tests\smoke.ps1` (PE mapping +
+emulator init end-to-end), `--selftest` (IRQL/APC/DPC/timer semantics, implemented in
+`host/main/kevlar.cpp`), and `tests\bridge_smoke.ps1` (the whole relay: `tests\bridge_driver.c`
+running under `--serve` while `tests\bridge_client.c` installs a service, starts it, opens the
+device and talks to it under `kevlar_hook.dll`). All assert on log text: changing a line one of
+them greps for breaks the test.
+
+`bridge_smoke.ps1` needs the WDK km headers and `ntoskrnl.lib` to compile its driver, and
+**skips** rather than fails without them — `smoke.ps1` stays the check that runs anywhere. Its
+per-request assertions read the *hook's* log, not the emulator's: KEVLAR's stdout is redirected
+there, so the CRT block-buffers it and stopping the process discards an unflushed tail.
 
 `--trace <file>` / `--check <file>` give deterministic record/replay for regression work on a
 specific driver: record on a known-good build, replay after a change, first divergence is reported.
@@ -133,20 +141,32 @@ routine, and block on a completion event signalled by `h_IofCompleteRequest`.
 `IoManager::DispatchMutex` serializes all of this and every relay must hold it — guest allocation
 is not concurrency-safe.
 
-Two relays sit on top, both off by default:
+One relay sits on top, off by default: `--serve[=name]` → `host/bridge/bridge_server.cpp`,
+a message-mode named pipe `\\.\pipe\kevlar-<name>` speaking the protocol in
+`bridge_protocol.h` (ENUM/OPEN/IOCTL/READ/WRITE/CLOSE). The flag also keeps the process
+alive past the idle-thread exit condition in `kevlar.cpp`.
 
-- `--serve[=name]` → `host/bridge/bridge_server.cpp`, a message-mode named pipe
-  `\\.\pipe\kevlar-<name>` speaking the protocol in `bridge_protocol.h`
-  (ENUM/OPEN/IOCTL/READ/WRITE/CLOSE).
-- `--proxy` → `host/bridge/proxy_relay.cpp` talking to `kevlarproxy.sys` (`kevlar_proxy/`, plain
-  WDM, wire protocol in `kevlar_proxy/kvp_protocol.h`), which captures real client IRPs on real
-  device objects and hands them up via an inverted call. Requires test signing; run it in a VM.
+The client side is `kevlar_hook/` — a DLL injected into an unmodified client so that
+`CreateService`/`StartService` are answered from a fake service database and the device
+open, IOCTL, read and write that follow are relayed over that pipe. The channel name is a
+constant both ends compile in (`Bridge::kDefaultPipeNameW`), *not* derived from the service
+name or the `.sys` filename: the only thing that has to correspond is the device the
+emulated driver creates and the device the client opens. `CreateProcess*` is
+hooked too, so the DLL follows the client down its process tree (launcher → the process
+that actually opens the device). It is a separate MSBuild project on purpose
+(`kevlar_hook\build_hook.ps1`), not part of `KEVLAR.sln`, but it links Zydis out of
+`vcpkg_installed`, so build the emulator first.
 
-Either flag also keeps the process alive past the idle-thread exit condition in `kevlar.cpp`.
+Because a process tree means several clients on one pipe, `bridge_server.cpp` serves each
+connection on its own thread and each connection owns its session table. Guest work is
+still serialized by `IoManager::DispatchMutex` — concurrent *connections*, one in-flight
+IRP. A kernel-mode proxy
+driver (`kevlarproxy.sys`) and an ntoskrnl namespace shadow used to sit alongside it; both
+were removed in favour of the hook, which reaches the same clients without test signing or
+an unsigned driver on the machine.
 
-`kevlar_proxy/README.md` is the design document for both relays, and code comments cite it by
-section (`kevlar_proxy/README.md SS3.5`). Its status header saying "not started" is stale — the
-rationale, constraints and the RequestorMode caveat in it are still current.
+`docs/bridge.md` is the design document for both sides, and code comments cite it by
+section (`docs/bridge.md SS3.5`).
 
 ### State isolation
 

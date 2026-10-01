@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -17,6 +18,8 @@
 
 // Raw NTSTATUS literals below follow this codebase's existing convention
 // (see core/io/irp_ioctl.cpp) of not depending on include/nt_define.h from core/host code.
+bool BridgeServer::ForceOpenEnabled = false;
+
 namespace {
 constexpr int32_t kStatusSuccess = 0;
 constexpr int32_t kStatusUnsuccessful = (int32_t)0xC0000001;
@@ -31,7 +34,7 @@ constexpr int32_t kStatusNotSupported = (int32_t)0xC00000BB;
 // literal usermode memory in this process; the buffers backing them come from
 // AllocateVariable in the kernel-range UC pool. Passing KernelMode here keeps
 // ProbeForRead/ProbeForWrite (and any driver's own previous-mode checks) from
-// rejecting them -- see kevlar_proxy/README.md SS3.5 and io_manager.h.
+// rejecting them -- see docs/bridge.md SS3.5 and io_manager.h.
 constexpr CHAR kBridgeRequestorMode = 0; // KernelMode
 
 struct SessionInfo {
@@ -44,8 +47,16 @@ std::atomic<bool> StopRequested{ false };
 std::thread ServerThread;
 std::wstring PipeName;
 
-std::mutex SessionLock;
-std::unordered_map<uint64_t, SessionInfo> Sessions;
+// Sessions belong to the connection that opened them. A launcher and the process it
+// spawns are two clients on this pipe at once, so a single global table would have
+// either one's exit tear down the other's FILE_OBJECTs.
+struct ClientState {
+    std::mutex Lock;
+    std::unordered_map<uint64_t, SessionInfo> Sessions;
+};
+
+// Ids stay unique across clients: a stray id from one connection then cannot name
+// another's session, and the log is unambiguous about which session is which.
 std::atomic<uint64_t> NextSessionId{ 1 };
 
 void AppendBytes(std::vector<uint8_t>& Buf, const void* Data, size_t Len) {
@@ -69,23 +80,23 @@ void SendResponse(HANDLE Pipe, int32_t Status, uint64_t Information, uint64_t Se
     WriteFile(Pipe, Buf.data(), (DWORD)Buf.size(), &Written, nullptr);
 }
 
-bool LookupSession(uint64_t SessionId, SessionInfo& Out) {
-    std::lock_guard<std::mutex> Guard(SessionLock);
-    auto It = Sessions.find(SessionId);
-    if (It == Sessions.end())
+bool LookupSession(ClientState& Client, uint64_t SessionId, SessionInfo& Out) {
+    std::lock_guard<std::mutex> Guard(Client.Lock);
+    auto It = Client.Sessions.find(SessionId);
+    if (It == Client.Sessions.end())
         return false;
     Out = It->second;
     return true;
 }
 
-// Tears down every session still open on this connection (kevlar_proxy/README.md
+// Tears down every session still open on this connection (docs/bridge.md
 // SS3.3): a crashed or sloppy client must not leak guest FILE_OBJECTs.
-void CloseAllSessions() {
+void CloseAllSessions(ClientState& Client) {
     std::vector<std::pair<uint64_t, SessionInfo>> ToClose;
     {
-        std::lock_guard<std::mutex> Guard(SessionLock);
-        ToClose.assign(Sessions.begin(), Sessions.end());
-        Sessions.clear();
+        std::lock_guard<std::mutex> Guard(Client.Lock);
+        ToClose.assign(Client.Sessions.begin(), Client.Sessions.end());
+        Client.Sessions.clear();
     }
     for (auto& [Id, Sess] : ToClose) {
         std::lock_guard<std::mutex> DispatchGuard(IoManager::DispatchMutex);
@@ -121,7 +132,7 @@ void HandleEnum(HANDLE Pipe, const Bridge::RequestHeader& Req) {
     SendResponse(Pipe, kStatusSuccess, Payload.size(), Req.Session, Payload.data(), (uint32_t)Payload.size());
 }
 
-void HandleOpen(HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* Payload) {
+void HandleOpen(ClientState& Client, HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* Payload) {
     if (Req.InLen == 0 || (Req.InLen % sizeof(wchar_t)) != 0) {
         SendResponse(Pipe, kStatusInvalidParameter, 0, 0, nullptr, 0);
         return;
@@ -144,28 +155,32 @@ void HandleOpen(HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* Pa
             return;
         }
         CreateResult = IoManager::DispatchCreate(DeviceObjUcAddr, FileObjUcAddr, kBridgeRequestorMode);
-        if (CreateResult.Status < 0)
+        if (CreateResult.Status < 0 && !BridgeServer::ForceOpenEnabled)
             IoManager::FreeFileObject(FileObjUcAddr);
     }
 
     if (CreateResult.Status < 0) {
-        SendResponse(Pipe, CreateResult.Status, 0, 0, nullptr, 0);
-        return;
+        if (!BridgeServer::ForceOpenEnabled) {
+            SendResponse(Pipe, CreateResult.Status, 0, 0, nullptr, 0);
+            return;
+        }
+        Logger::Log("{YEL}BridgeServer: CREATE denied %ls (0x%08X) - keeping the session "
+            "anyway (--force-open){RESET}\n", Name.c_str(), (unsigned)CreateResult.Status);
     }
 
     uint64_t SessionId = NextSessionId.fetch_add(1);
     {
-        std::lock_guard<std::mutex> Guard(SessionLock);
-        Sessions[SessionId] = { DeviceObjUcAddr, FileObjUcAddr };
+        std::lock_guard<std::mutex> Guard(Client.Lock);
+        Client.Sessions[SessionId] = { DeviceObjUcAddr, FileObjUcAddr };
     }
 
     Logger::Log("{GRN}BridgeServer: OPEN %ls -> session %llu{RESET}\n", Name.c_str(), SessionId);
     SendResponse(Pipe, CreateResult.Status, CreateResult.Information, SessionId, nullptr, 0);
 }
 
-void HandleIoctl(HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* Payload) {
+void HandleIoctl(ClientState& Client, HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* Payload) {
     SessionInfo Sess;
-    if (!LookupSession(Req.Session, Sess)) {
+    if (!LookupSession(Client, Req.Session, Sess)) {
         SendResponse(Pipe, kStatusInvalidHandle, 0, Req.Session, nullptr, 0);
         return;
     }
@@ -191,9 +206,9 @@ void HandleIoctl(HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* P
 // Offset is always 0: this bridge exposes sequential read/write, not a seekable
 // file position. A driver that requires ByteOffset-based access needs the
 // protocol extended with an explicit offset field.
-void HandleRead(HANDLE Pipe, const Bridge::RequestHeader& Req) {
+void HandleRead(ClientState& Client, HANDLE Pipe, const Bridge::RequestHeader& Req) {
     SessionInfo Sess;
-    if (!LookupSession(Req.Session, Sess)) {
+    if (!LookupSession(Client, Req.Session, Sess)) {
         SendResponse(Pipe, kStatusInvalidHandle, 0, Req.Session, nullptr, 0);
         return;
     }
@@ -213,9 +228,9 @@ void HandleRead(HANDLE Pipe, const Bridge::RequestHeader& Req) {
     SendResponse(Pipe, Result.Status, Result.Information, Req.Session, OutBuf.data(), CopyLen);
 }
 
-void HandleWrite(HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* Payload) {
+void HandleWrite(ClientState& Client, HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* Payload) {
     SessionInfo Sess;
-    if (!LookupSession(Req.Session, Sess)) {
+    if (!LookupSession(Client, Req.Session, Sess)) {
         SendResponse(Pipe, kStatusInvalidHandle, 0, Req.Session, nullptr, 0);
         return;
     }
@@ -233,16 +248,16 @@ void HandleWrite(HANDLE Pipe, const Bridge::RequestHeader& Req, const uint8_t* P
     SendResponse(Pipe, Result.Status, Result.Information, Req.Session, nullptr, 0);
 }
 
-void HandleClose(HANDLE Pipe, const Bridge::RequestHeader& Req) {
+void HandleClose(ClientState& Client, HANDLE Pipe, const Bridge::RequestHeader& Req) {
     SessionInfo Sess;
     bool Found;
     {
-        std::lock_guard<std::mutex> Guard(SessionLock);
-        auto It = Sessions.find(Req.Session);
-        Found = It != Sessions.end();
+        std::lock_guard<std::mutex> Guard(Client.Lock);
+        auto It = Client.Sessions.find(Req.Session);
+        Found = It != Client.Sessions.end();
         if (Found) {
             Sess = It->second;
-            Sessions.erase(It);
+            Client.Sessions.erase(It);
         }
     }
     if (!Found) {
@@ -292,6 +307,7 @@ bool ReadMessage(HANDLE Pipe, std::vector<uint8_t>& Buf, size_t MaxBytes) {
 }
 
 void ServeClient(HANDLE Pipe) {
+    ClientState Client;
     std::vector<uint8_t> Buf;
     const size_t MaxMsg = sizeof(Bridge::RequestHeader) + Bridge::kMaxPayload;
 
@@ -318,20 +334,65 @@ void ServeClient(HANDLE Pipe) {
 
         switch ((Bridge::Opcode)Req.Opcode) {
         case Bridge::Opcode::Enum:  HandleEnum(Pipe, Req); break;
-        case Bridge::Opcode::Open:  HandleOpen(Pipe, Req, Payload); break;
-        case Bridge::Opcode::Ioctl: HandleIoctl(Pipe, Req, Payload); break;
-        case Bridge::Opcode::Read:  HandleRead(Pipe, Req); break;
-        case Bridge::Opcode::Write: HandleWrite(Pipe, Req, Payload); break;
-        case Bridge::Opcode::Close: HandleClose(Pipe, Req); break;
+        case Bridge::Opcode::Open:  HandleOpen(Client, Pipe, Req, Payload); break;
+        case Bridge::Opcode::Ioctl: HandleIoctl(Client, Pipe, Req, Payload); break;
+        case Bridge::Opcode::Read:  HandleRead(Client, Pipe, Req); break;
+        case Bridge::Opcode::Write: HandleWrite(Client, Pipe, Req, Payload); break;
+        case Bridge::Opcode::Close: HandleClose(Client, Pipe, Req); break;
         default:
             SendResponse(Pipe, kStatusNotSupported, 0, Req.Session, nullptr, 0);
             break;
         }
     }
 
-    CloseAllSessions();
+    CloseAllSessions(Client);
     FlushFileBuffers(Pipe);
     DisconnectNamedPipe(Pipe);
+}
+
+// One thread per accepted connection, so a client that sits on its pipe does not lock
+// every other client out. Guest work stays serialised regardless: every dispatch below
+// still goes through IoManager::DispatchMutex.
+struct Connection {
+    HANDLE Pipe = INVALID_HANDLE_VALUE;
+    std::atomic<bool> Finished{ false };
+    std::thread Worker;
+};
+
+std::mutex ConnectionLock;
+std::vector<std::unique_ptr<Connection>> Connections;
+
+// Joins and closes connections whose worker has already returned. Called from the accept
+// loop so a long-lived server does not accumulate dead threads.
+void ReapFinishedConnections() {
+    std::lock_guard<std::mutex> Guard(ConnectionLock);
+    for (size_t I = 0; I < Connections.size();) {
+        if (Connections[I]->Finished.load()) {
+            if (Connections[I]->Worker.joinable())
+                Connections[I]->Worker.join();
+            CloseHandle(Connections[I]->Pipe);
+            Connections.erase(Connections.begin() + I);
+        } else {
+            I++;
+        }
+    }
+}
+
+// Unblocks every client thread and waits for it. A worker parked in ReadFile does not
+// see StopRequested on its own, so cancel its I/O and drop the connection first.
+void StopAllConnections() {
+    std::vector<std::unique_ptr<Connection>> ToStop;
+    {
+        std::lock_guard<std::mutex> Guard(ConnectionLock);
+        ToStop.swap(Connections);
+    }
+    for (auto& Conn : ToStop) {
+        CancelIoEx(Conn->Pipe, nullptr);
+        DisconnectNamedPipe(Conn->Pipe);
+        if (Conn->Worker.joinable())
+            Conn->Worker.join();
+        CloseHandle(Conn->Pipe);
+    }
 }
 
 void ServerLoop() {
@@ -363,12 +424,23 @@ void ServerLoop() {
             continue;
         }
 
-        Logger::Log("{GRN}BridgeServer: client connected{RESET}\n");
-        ServeClient(Pipe);
-        Logger::Log("{GRY}BridgeServer: client disconnected{RESET}\n");
-        CloseHandle(Pipe);
+        ReapFinishedConnections();
+
+        auto Conn = std::make_unique<Connection>();
+        Conn->Pipe = Pipe;
+        Connection* Raw = Conn.get();
+        Conn->Worker = std::thread([Raw] {
+            Logger::Log("{GRN}BridgeServer: client connected{RESET}\n");
+            ServeClient(Raw->Pipe);
+            Logger::Log("{GRY}BridgeServer: client disconnected{RESET}\n");
+            Raw->Finished = true;
+        });
+
+        std::lock_guard<std::mutex> Guard(ConnectionLock);
+        Connections.push_back(std::move(Conn));
     }
 
+    StopAllConnections();
     Logger::Log("{CYN}BridgeServer: stopped{RESET}\n");
 }
 
@@ -380,7 +452,7 @@ bool Start(const std::string& Name) {
     if (Active.load())
         return false;
 
-    std::string PipeNameA = "\\\\.\\pipe\\kevlar-" + Name;
+    std::string PipeNameA = std::string(Bridge::kPipePrefixA) + Name;
     PipeName.assign(PipeNameA.begin(), PipeNameA.end());
     StopRequested = false;
     Active = true;
