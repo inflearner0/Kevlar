@@ -846,7 +846,11 @@ NTSTATUS h_NtQuerySystemInformation(uint32_t SystemInformationClass, uintptr_t S
                 }
             }
 
-            if (!HyperVideoInjected && (ULONG)WriteIdx < MaxModulesByLen) {
+            static const bool InjectHyperVideo = [] {
+                const char* Env = std::getenv("KEVLAR_INJECT_HYPERVIDEO");
+                return !(Env && Env[0] == '0');
+            };
+            if (!HyperVideoInjected && InjectHyperVideo && (ULONG)WriteIdx < MaxModulesByLen) {
                 auto& hvMod = loadedmodules->Modules[WriteIdx];
                 memset(&hvMod, 0, sizeof(hvMod));
                 uint64_t hvBase = 0xFFFFF80301000000ULL;
@@ -1133,7 +1137,11 @@ NTSTATUS h_ZwQueryValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, KEY_VALU
         return (NTSTATUS)0xC0000002;
     }
 
+    std::wstring PassName(LocalValName.Buffer ? LocalValName.Buffer : L"",
+        LocalValName.Length / sizeof(wchar_t));
     auto ret = __NtRoutine("NtQueryValueKey", KeyHandle, &LocalValName, KeyValueInformationClass, HostKvi, Length, HostResLen);
+    Logger::Log("{YEL}\tNtQueryValueKey(passthrough): handle=%llx value='%ls' -> 0x%08x{RESET}\n",
+        (unsigned long long)(uintptr_t)KeyHandle, PassName.c_str(), (uint32_t)ret);
     return ret;
 }
 

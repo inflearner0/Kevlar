@@ -4,6 +4,7 @@
 #include <Logger/Logger.h>
 #include "core/exec/instruction_emulator.h"
 #include "core/memory/unicorn_memory.h"
+#include "core/diagnostics/vm_lift.h"
 #include "core/process/unicorn_threading.h"
 #include "core/exception/seh_dispatch.h"
 #include "core/diagnostics/diag_center.h"
@@ -12,6 +13,8 @@
 
 bool UnicornEmu::DiagnosticHooksEnabled = false;
 bool UnicornEmu::VgkErrorOverrideEnabled = false;
+bool UnicornEmu::ForceSuccessEnabled = false;
+bool UnicornEmu::KeepDeviceEnabled = false;
 bool UnicornEmu::SehDispatchEnabled = true;
 bool UnicornEmu::ModuleReadLoggingEnabled = false;
 bool UnicornEmu::IntelCpuSpoofEnabled = false;
@@ -299,10 +302,17 @@ uc_engine* UnicornEmu::CreateEngine() {
     SetupMsrs(Uc);
     InitMsrStore();
 
+    // Profiling the primary engine alone misses the spawned threads, which is
+    // where target work usually runs (e.g. EAC's init workers).
+    InstallBlockProfiler(Uc);
+
     {
         uc_hook Hh;
         for (auto& Mod : MappedSysMods) {
-            uc_err HookErr = uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)Hooks::OnSysModExec, nullptr,
+            // Block-level for the same reason as the primary engine install in
+            // module_mapper.cpp: per-instruction callbacks over a 21 MB ntoskrnl
+            // are the single largest emulation cost.
+            uc_err HookErr = uc_hook_add(Uc, &Hh, UC_HOOK_BLOCK, (void*)Hooks::OnSysModExec, nullptr,
                 Mod.UcBase, Mod.UcBase + Mod.Size - 1);
             if (HookErr != UC_ERR_OK) {
                 Logger::Log("{RED}CreateEngine: OnSysModExec hook for '%s' failed: %s{RESET}\n",
@@ -354,6 +364,10 @@ void UnicornEmu::SetupHooks(uc_engine* Uc) {
     uc_hook_add(Uc, &Hh, UC_HOOK_INSN, (void*)Hooks::OnVmExit, nullptr, 1, 0, UC_X86_INS_VMXOFF);
 
     InstallBlockProfiler(Uc);
+
+    // Spawned guest threads each get their own engine; the VM tracer has to go
+    // on every one of them or IRP dispatch runs untraced.
+    VmLift::InstallTracerOnEngine(Uc);
 }
 
 void UnicornEmu::SetupGdt(uc_engine* Uc) {

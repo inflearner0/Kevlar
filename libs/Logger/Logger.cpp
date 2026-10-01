@@ -29,6 +29,9 @@ static HANDLE hConsole = INVALID_HANDLE_VALUE;
 static FILE* hLogFile = nullptr;
 static std::mutex logMutex;
 static bool gPerThreadEnabled = false;
+static bool gQuiet = false;
+static uint32_t gQuietFlushCounter = 0;
+static ULONGLONG gQuietLastFlush = 0;
 static std::string gPerThreadFolder;
 static uint32_t gNextThreadIndex = 1;
 
@@ -175,6 +178,11 @@ bool Logger::InitFile(const char* Path) {
     return false;
 }
 
+void Logger::SetQuiet(bool Quiet) {
+    std::lock_guard<std::mutex> guard(logMutex);
+    gQuiet = Quiet;
+}
+
 bool Logger::EnablePerThreadFiles(const char* FolderPath) {
     std::lock_guard<std::mutex> guard(logMutex);
     if (!FolderPath || !FolderPath[0]) return false;
@@ -231,6 +239,22 @@ void Logger::CloseFile() {
     }
 }
 
+static void EmitLocked(const char* Clean) {
+    if (hLogFile) {
+        fprintf(hLogFile, "%s", Clean);
+        if (!gQuiet) {
+            fflush(hLogFile);
+            WriteThreadLogLocked(Clean);
+        } else if (++gQuietFlushCounter >= 64 || (GetTickCount64() - gQuietLastFlush) >= 250) {
+            gQuietFlushCounter = 0;
+            gQuietLastFlush = GetTickCount64();
+            fflush(hLogFile);
+        }
+    } else if (!gQuiet) {
+        WriteThreadLogLocked(Clean);
+    }
+}
+
 void Logger::Log(const char* format, ...) {
     char buf[4096];
     va_list args;
@@ -240,20 +264,14 @@ void Logger::Log(const char* format, ...) {
     if (n <= 0) return;
 
     std::lock_guard<std::mutex> guard(logMutex);
-    PrintColored(buf);
-    ResetColor();
-
-    if (hLogFile) {
-        char clean[4096];
-        StripColorTags(buf, clean, sizeof(clean));
-        fprintf(hLogFile, "%s", clean);
-        fflush(hLogFile);
-        WriteThreadLogLocked(clean);
-    } else {
-        char clean[4096];
-        StripColorTags(buf, clean, sizeof(clean));
-        WriteThreadLogLocked(clean);
+    if (!gQuiet) {
+        PrintColored(buf);
+        ResetColor();
     }
+
+    char clean[4096];
+    StripColorTags(buf, clean, sizeof(clean));
+    EmitLocked(clean);
 }
 
 void Logger::Log(wchar_t* format, ...) {
@@ -268,20 +286,14 @@ void Logger::Log(wchar_t* format, ...) {
     wcstombs_s(nullptr, narrow, wbuf, _TRUNCATE);
 
     std::lock_guard<std::mutex> guard(logMutex);
-    PrintColored(narrow);
-    ResetColor();
-
-    if (hLogFile) {
-        char clean[4096];
-        StripColorTags(narrow, clean, sizeof(clean));
-        fprintf(hLogFile, "%s", clean);
-        fflush(hLogFile);
-        WriteThreadLogLocked(clean);
-    } else {
-        char clean[4096];
-        StripColorTags(narrow, clean, sizeof(clean));
-        WriteThreadLogLocked(clean);
+    if (!gQuiet) {
+        PrintColored(narrow);
+        ResetColor();
     }
+
+    char clean[4096];
+    StripColorTags(narrow, clean, sizeof(clean));
+    EmitLocked(clean);
 }
 
 void Logger::Log(LogColor color, const char* format, ...) {
@@ -293,19 +305,13 @@ void Logger::Log(LogColor color, const char* format, ...) {
     if (n <= 0) return;
 
     std::lock_guard<std::mutex> guard(logMutex);
-    SetColor(static_cast<WORD>(color));
-    PrintColored(buf);
-    ResetColor();
-
-    if (hLogFile) {
-        char clean[4096];
-        StripColorTags(buf, clean, sizeof(clean));
-        fprintf(hLogFile, "%s", clean);
-        fflush(hLogFile);
-        WriteThreadLogLocked(clean);
-    } else {
-        char clean[4096];
-        StripColorTags(buf, clean, sizeof(clean));
-        WriteThreadLogLocked(clean);
+    if (!gQuiet) {
+        SetColor(static_cast<WORD>(color));
+        PrintColored(buf);
+        ResetColor();
     }
+
+    char clean[4096];
+    StripColorTags(buf, clean, sizeof(clean));
+    EmitLocked(clean);
 }

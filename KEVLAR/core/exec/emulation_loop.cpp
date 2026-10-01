@@ -5,9 +5,11 @@
 #include "core/exec/instruction_emulator.h"
 #include "core/memory/unicorn_memory.h"
 #include "core/exception/seh_dispatch.h"
+#include "core/process/unicorn_threading.h"
 #include <atomic>
 #include <vector>
 #include <unordered_map>
+#include <cstdlib>
 
 // Every instruction Unicorn cannot execute costs a full exit from uc_emu_start
 // plus a re-entry, which is orders of magnitude more expensive than the
@@ -100,6 +102,126 @@ bool UnicornEmu::StartEmulation(uc_engine* Uc, uint64_t EntryPoint) {
     uc_mem_write(Uc, StackTop, &RetAddr, 8);
     uc_reg_write(Uc, UC_X86_REG_RSP, &StackTop);
 
+    // Zero-perturbation return trap (KEVLAR_RET_TRAP=1 or --force-success): watch
+    // the single stack cell holding the sentinel return address. The final ret of
+    // DriverEntry reads it exactly once; the hook's RIP is the return site. With
+    // --force-success the guest RAX is rewritten to 0 there, so the driver's own
+    // ret instruction returns STATUS_SUCCESS instead of a post-hoc log override.
+    {
+        const char* RetTrap = std::getenv("KEVLAR_RET_TRAP");
+        if ((RetTrap && RetTrap[0] == '1') || UnicornEmu::ForceSuccessEnabled) {
+            using RetTrapFn = void(*)(uc_engine*, uc_mem_type, uint64_t, int, int64_t, void*);
+            static RetTrapFn TrapFn = [](uc_engine* TrapUc, uc_mem_type Type, uint64_t Addr, int Size, int64_t Val, void* UserData) {
+                uint64_t Present = 0;
+                uc_mem_read(TrapUc, Addr, &Present, 8);
+                if (Present != SENTINEL_RET_ADDR)
+                    return;
+                uint64_t Rip = 0, Rsp = 0, Rax = 0, Rbp = 0, R12 = 0, R13 = 0;
+                uc_reg_read(TrapUc, UC_X86_REG_RIP, &Rip);
+                uc_reg_read(TrapUc, UC_X86_REG_RSP, &Rsp);
+                uc_reg_read(TrapUc, UC_X86_REG_RAX, &Rax);
+                uc_reg_read(TrapUc, UC_X86_REG_RBP, &Rbp);
+                uc_reg_read(TrapUc, UC_X86_REG_R12, &R12);
+                uc_reg_read(TrapUc, UC_X86_REG_R13, &R13);
+                const bool IsRealRet = (Rsp == Addr);
+                if (UnicornEmu::ForceSuccessEnabled && IsRealRet && (uint32_t)Rax != 0) {
+                    Logger::Log("{YEL}[RET OVERRIDE] DriverEntry return value 0x%08X -> 0x00000000 at RIP=0x%llx (drv+0x%llx) (--force-success){RESET}\n",
+                        (uint32_t)Rax, Rip,
+                        (Rip >= DRIVER_BASE_UC && Rip < DRIVER_BASE_UC + 0x10000000ULL) ? Rip - DRIVER_BASE_UC : 0ULL);
+                    uint64_t Zero = 0;
+                    uc_reg_write(TrapUc, UC_X86_REG_RAX, &Zero);
+                    Rax = 0;
+                }
+                Logger::Log("{MAG}[RET TRAP] sentinel popped at RIP=0x%llx (drv+0x%llx) RSP=0x%llx RAX=0x%llx RBP=0x%llx R12=0x%llx R13=0x%llx{RESET}\n",
+                    Rip, (Rip >= DRIVER_BASE_UC && Rip < DRIVER_BASE_UC + 0x10000000ULL) ? Rip - DRIVER_BASE_UC : 0ULL,
+                    Rsp, Rax, Rbp, R12, R13);
+            };
+            uc_hook TrapHook;
+            uc_err TrapErr = uc_hook_add(Uc, &TrapHook, UC_HOOK_MEM_READ, (void*)TrapFn, nullptr, StackTop, StackTop + 7);
+            if (TrapErr == UC_ERR_OK)
+                Logger::Log("{CYN}Return trap installed on stack cell 0x%llx{RESET}\n", StackTop);
+            else
+                Logger::Log("{RED}Return trap install failed: %s{RESET}\n", uc_strerror(TrapErr));
+
+            // Extra read traps for enumerating the return chain (comma-separated
+            // hex addresses, e.g. the call-return cell DriverEntry uses).
+            const char* TrapAddrs = std::getenv("KEVLAR_TRAP_ADDRS");
+            if (TrapAddrs && TrapAddrs[0]) {
+                using ListTrapFn = void(*)(uc_engine*, uc_mem_type, uint64_t, int, int64_t, void*);
+                static ListTrapFn ListTrap = [](uc_engine* TrapUc, uc_mem_type Type, uint64_t Addr, int Size, int64_t Val, void* UserData) {
+                    uint64_t Present = 0;
+                    uc_mem_read(TrapUc, Addr, &Present, 8);
+                    if (!Present)
+                        return;
+                    uint64_t Rip = 0, Rsp = 0, Rax = 0, R12 = 0;
+                    uc_reg_read(TrapUc, UC_X86_REG_RIP, &Rip);
+                    uc_reg_read(TrapUc, UC_X86_REG_RSP, &Rsp);
+                    uc_reg_read(TrapUc, UC_X86_REG_RAX, &Rax);
+                    uc_reg_read(TrapUc, UC_X86_REG_R12, &R12);
+                    Logger::Log("{MAG}[TRAP 0x%llx] read at RIP=0x%llx (drv+0x%llx) content=0x%llx RAX=0x%llx RSP=0x%llx R12=0x%llx{RESET}\n",
+                        Addr, Rip, (Rip >= DRIVER_BASE_UC && Rip < DRIVER_BASE_UC + 0x10000000ULL) ? Rip - DRIVER_BASE_UC : 0ULL,
+                        Present, Rax, Rsp, R12);
+                };
+                std::string List(TrapAddrs);
+                size_t Pos = 0;
+                while (Pos < List.size()) {
+                    size_t Comma = List.find(',', Pos);
+                    std::string Tok = List.substr(Pos, Comma == std::string::npos ? std::string::npos : Comma - Pos);
+                    Pos = (Comma == std::string::npos) ? List.size() : Comma + 1;
+                    uint64_t Addr = strtoull(Tok.c_str(), nullptr, 0);
+                    if (!Addr)
+                        continue;
+                    uc_hook ExtraHook;
+                    if (uc_hook_add(Uc, &ExtraHook, UC_HOOK_MEM_READ, (void*)ListTrap, nullptr, Addr, Addr + 7) == UC_ERR_OK)
+                        Logger::Log("{CYN}Extra read trap installed on 0x%llx{RESET}\n", Addr);
+                    else
+                        Logger::Log("{RED}Extra read trap install failed for 0x%llx{RESET}\n", Addr);
+                }
+            }
+
+            // Write traps (KEVLAR_TRAP_WRITES): log writes of STATUS_OBJECT_NAME_NOT_FOUND
+            // to the listed cells, together with the caller return address.
+            const char* TrapWrites = std::getenv("KEVLAR_TRAP_WRITES");
+            if (TrapWrites && TrapWrites[0]) {
+                using WriteTrapFn = void(*)(uc_engine*, uc_mem_type, uint64_t, int, int64_t, void*);
+                static WriteTrapFn WriteTrap = [](uc_engine* TrapUc, uc_mem_type Type, uint64_t Addr, int Size, int64_t Val, void* UserData) {
+                    uint64_t Cell = (uint64_t)UserData;
+                    uint64_t Now = 0;
+                    uc_mem_read(TrapUc, Cell, &Now, 8);
+                    if ((Now & 0xFFFFFFFFULL) != 0xC0000034ULL)
+                        return;
+                    uint64_t Rip = 0, Rsp = 0, Rax = 0, R12 = 0, Caller = 0;
+                    uc_reg_read(TrapUc, UC_X86_REG_RIP, &Rip);
+                    uc_reg_read(TrapUc, UC_X86_REG_RSP, &Rsp);
+                    uc_reg_read(TrapUc, UC_X86_REG_RAX, &Rax);
+                    uc_reg_read(TrapUc, UC_X86_REG_R12, &R12);
+                    uc_mem_read(TrapUc, Rsp, &Caller, 8);
+                    Logger::Log("{MAG}[WTRAP 0x%llx] access=0x%llx size=%d value=0x%llx written at RIP=0x%llx (drv+0x%llx) caller=0x%llx (drv+0x%llx) RAX=0x%llx RSP=0x%llx R12=0x%llx{RESET}\n",
+                        Cell, Addr, Size, Now, Rip,
+                        (Rip >= DRIVER_BASE_UC && Rip < DRIVER_BASE_UC + 0x10000000ULL) ? Rip - DRIVER_BASE_UC : 0ULL,
+                        Caller,
+                        (Caller >= DRIVER_BASE_UC && Caller < DRIVER_BASE_UC + 0x10000000ULL) ? Caller - DRIVER_BASE_UC : 0ULL,
+                        Rax, Rsp, R12);
+                };
+                std::string WList(TrapWrites);
+                size_t WPos = 0;
+                while (WPos < WList.size()) {
+                    size_t Comma = WList.find(',', WPos);
+                    std::string Tok = WList.substr(WPos, Comma == std::string::npos ? std::string::npos : Comma - WPos);
+                    WPos = (Comma == std::string::npos) ? WList.size() : Comma + 1;
+                    uint64_t Addr = strtoull(Tok.c_str(), nullptr, 0);
+                    if (!Addr)
+                        continue;
+                    uc_hook WHook;
+                    if (uc_hook_add(Uc, &WHook, UC_HOOK_MEM_WRITE, (void*)WriteTrap, (void*)Addr, Addr, Addr + 7) == UC_ERR_OK)
+                        Logger::Log("{CYN}Write trap installed on 0x%llx{RESET}\n", Addr);
+                    else
+                        Logger::Log("{RED}Write trap install failed for 0x%llx{RESET}\n", Addr);
+                }
+            }
+        }
+    }
+
     uint64_t Rcx = DRIVER_OBJ_BASE_UC;
     uint64_t Rdx = REGISTRY_PATH_BASE_UC;
     uc_reg_write(Uc, UC_X86_REG_RCX, &Rcx);
@@ -140,6 +262,30 @@ bool UnicornEmu::StartEmulation(uc_engine* Uc, uint64_t EntryPoint) {
             double Elapsed = (double)(Now.QuadPart - Start.QuadPart) / (double)Freq.QuadPart;
             uint64_t DriverRva = (Rip >= DRIVER_BASE_UC) ? (Rip - DRIVER_BASE_UC) : 0;
             Logger::Log("{GRY}[HEARTBEAT %.1fs] RIP=0x%llx (drv+0x%llx){RESET}\n", Elapsed, Rip, DriverRva);
+
+            // The primary thread often waits in a guest spinlock while a
+            // PsCreateSystemThread worker performs the real initialization.
+            // Sample every live engine so the ordinary heartbeat identifies the
+            // worker that is making progress (or the exact worker that is stuck).
+            {
+                std::lock_guard<std::mutex> Guard(UnicornThread::ThreadLock);
+                for (const auto& Entry : UnicornThread::ThreadMap) {
+                    const auto* Ctx = Entry.second;
+                    if (!Ctx || !Ctx->Engine)
+                        continue;
+
+                    uint64_t WorkerRip = 0, WorkerRsp = 0, WorkerRsi = 0;
+                    uc_reg_read(Ctx->Engine, UC_X86_REG_RIP, &WorkerRip);
+                    uc_reg_read(Ctx->Engine, UC_X86_REG_RSP, &WorkerRsp);
+                    uc_reg_read(Ctx->Engine, UC_X86_REG_RSI, &WorkerRsi);
+                    uint64_t WorkerRva = (WorkerRip >= DRIVER_BASE_UC) ?
+                        (WorkerRip - DRIVER_BASE_UC) : 0;
+                    Logger::Log("{GRY}[WORKER %.1fs] tid=%llu host=%lu running=%d "
+                        "RIP=0x%llx (drv+0x%llx) RSP=0x%llx RSI=0x%llx{RESET}\n",
+                        Elapsed, Ctx->ThreadId, Entry.first, Ctx->Running ? 1 : 0,
+                        WorkerRip, WorkerRva, WorkerRsp, WorkerRsi);
+                }
+            }
 
             if (UnicornEmu::BlockProfileEnabled) {
                 // A register walking a range at a steady rate is what separates a

@@ -9,6 +9,7 @@
 #include "core/exception/seh_dispatch.h"
 #include <SymParser/symparser.hpp>
 #include <intrin.h>
+#include <cstdlib>
 
 int DrvObjReadCount = 0;
 
@@ -132,6 +133,22 @@ void UnicornEmu::Hooks::OnSysModExec(uc_engine* Uc, uint64_t Addr, uint32_t Size
                         uc_reg_write(Uc, UC_X86_REG_RSP, &Rsp);
                         uc_reg_write(Uc, UC_X86_REG_RIP, &RetAddr);
                     }
+                    // Negative cache: this address is not a resolvable entry
+                    // point. Remember that so later executions of this block skip
+                    // the full module scan (GetExport/GetAllExports/PDB) above;
+                    // the else branch below replicates the unknown-entry behavior
+                    // cheaply, without logging hot internal blocks.
+                    LocalEntry.UcBase = Mod.UcBase;
+                    LocalEntry.Size = Mod.Size;
+                    LocalEntry.ModName = Mod.Name;
+                    LocalEntry.FuncName.clear();
+                    LocalEntry.HostFunc = nullptr;
+                    LocalEntry.IsPassthrough = false;
+                    LocalEntry.IsKnown = false;
+                    {
+                        std::lock_guard<std::mutex> Guard(SysModFuncCacheLock);
+                        SysModFuncCache[Addr] = LocalEntry;
+                    }
                     return;
                 }
                 LocalEntry.UcBase = Mod.UcBase;
@@ -197,6 +214,19 @@ void UnicornEmu::Hooks::OnSysModExec(uc_engine* Uc, uint64_t Addr, uint32_t Size
         for (int I = 0; I < 12; I++) {
             UcReadU64(Uc, Rsp + 0x28 + I * 8, StackArgs[I]);
         }
+        static const char* StackWalkApisSm = std::getenv("KEVLAR_STACKWALK_APIS");
+        if (StackWalkApisSm && StackWalkApisSm[0] && strstr(StackWalkApisSm, Entry->FuncName.c_str())) {
+            Logger::Log("{MAG}[STACKWALK-SM] %s RSP=0x%llx{RESET}\n", Entry->FuncName.c_str(), Rsp);
+            for (int I = 0; I < 64; I++) {
+                uint64_t Val = 0;
+                uc_mem_read(Uc, Rsp + I * 8, &Val, 8);
+                if (Val == 0)
+                    continue;
+                if (Val >= DRIVER_BASE_UC && Val < DRIVER_BASE_UC + 0x10000000ULL) {
+                    Logger::Log("{MAG}  [RSP+0x%02x] drv+0x%llx{RESET}\n", I * 8, Val - DRIVER_BASE_UC);
+                }
+            }
+        }
         auto CallResult = CallHookSafe(Entry->HostFunc, Rcx, Rdx, R8, R9, StackArgs);
         uint64_t RetVal = CallResult.RetVal;
         if (CallResult.Crashed) {
@@ -217,7 +247,8 @@ void UnicornEmu::Hooks::OnSysModExec(uc_engine* Uc, uint64_t Addr, uint32_t Size
             case 0xC0000004:
             case 0xC0000023:
             case 0xC0000225:
-            case 0xC0000034:
+            // 0xC0000034 intentionally NOT filtered: a real NAME_NOT_FOUND from
+            // an API call is exactly what a failed init tends to hide behind.
             case 0xC000007A:
                 IsExpectedError = true;
                 break;
@@ -261,21 +292,33 @@ void UnicornEmu::Hooks::OnSysModExec(uc_engine* Uc, uint64_t Addr, uint32_t Size
         UcReadU64(Uc, Rsp, RetAddr);
         bool CalledFromOutside = (RetAddr < Entry->UcBase || RetAddr >= Entry->UcBase + Entry->Size);
         if (CalledFromOutside) {
-            if (StrictExportsEnabled) {
+            if (Entry->FuncName.empty()) {
+                // Negative-cached unknown code called from outside the module.
+                Logger::Log("{YEL}SysMod exec: {WHT}%s!<unknown> {GRY}(0x%llx) {YEL}-> forcing RET 0{RESET}\n",
+                    Entry->ModName.c_str(), Addr);
+                uint64_t Zero = 0;
+                uc_reg_write(Uc, UC_X86_REG_RAX, &Zero);
+                Rsp += 8;
+                uc_reg_write(Uc, UC_X86_REG_RSP, &Rsp);
+                uc_reg_write(Uc, UC_X86_REG_RIP, &RetAddr);
+            } else if (StrictExportsEnabled) {
                 Logger::Log("{RED}SysMod UNHANDLED: {WHT}%s!%s {GRY}(0x%llx) {RED}-> STATUS_NOT_IMPLEMENTED (strict){RESET}\n",
                     Entry->ModName.c_str(), Entry->FuncName.c_str(), Addr);
                 uint64_t Status = 0xC0000002ULL; // STATUS_NOT_IMPLEMENTED
                 uc_reg_write(Uc, UC_X86_REG_RAX, &Status);
+                Rsp += 8;
+                uc_reg_write(Uc, UC_X86_REG_RSP, &Rsp);
+                uc_reg_write(Uc, UC_X86_REG_RIP, &RetAddr);
             } else {
                 Logger::Log("{RED}SysMod UNHANDLED: {WHT}%s!%s {GRY}(0x%llx) {RED}-> forcing RET 0{RESET}\n",
                     Entry->ModName.c_str(), Entry->FuncName.c_str(), Addr);
                 uint64_t Zero = 0;
                 uc_reg_write(Uc, UC_X86_REG_RAX, &Zero);
+                Rsp += 8;
+                uc_reg_write(Uc, UC_X86_REG_RSP, &Rsp);
+                uc_reg_write(Uc, UC_X86_REG_RIP, &RetAddr);
             }
-            Rsp += 8;
-            uc_reg_write(Uc, UC_X86_REG_RSP, &Rsp);
-            uc_reg_write(Uc, UC_X86_REG_RIP, &RetAddr);
-        } else {
+        } else if (!Entry->FuncName.empty()) {
             Logger::Log("{YEL}SysMod internal: {WHT}%s!%s {GRY}(0x%llx) {YEL}-> letting execute{RESET}\n",
                 Entry->ModName.c_str(), Entry->FuncName.c_str(), Addr);
         }
@@ -319,6 +362,25 @@ void UnicornEmu::Hooks::OnSentinelExec(uc_engine* Uc, uint64_t Addr, uint32_t Si
     strncpy_s(HookRing[HookRingIdx % 16], 64, EntryCopy.Name.c_str(), _TRUNCATE);
     HookRingIdx++;
     LastHookName = EntryCopy.Name.c_str();
+
+    // Optional stack walk for selected APIs (KEVLAR_STACKWALK_APIS, comma
+    // separated, substring match). The guest stack then holds the VM handler
+    // call chain that led to this call, which identifies a failing init path
+    // without per-instruction tracing.
+    static const char* StackWalkApis = std::getenv("KEVLAR_STACKWALK_APIS");
+    if (StackWalkApis && StackWalkApis[0] && strstr(StackWalkApis, EntryCopy.Name.c_str())) {
+        Logger::Log("{MAG}[STACKWALK] %s caller=drv+0x%llx{RESET}\n", EntryCopy.Name.c_str(),
+            (RetRip >= DRIVER_BASE_UC && RetRip < DRIVER_BASE_UC + 0x10000000ULL) ? RetRip - DRIVER_BASE_UC : 0ULL);
+        for (int I = 0; I < 64; I++) {
+            uint64_t Val = 0;
+            uc_mem_read(Uc, Rsp + I * 8, &Val, 8);
+            if (Val == 0)
+                continue;
+            if (Val >= DRIVER_BASE_UC && Val < DRIVER_BASE_UC + 0x10000000ULL) {
+                Logger::Log("{MAG}  [RSP+0x%02x] drv+0x%llx{RESET}\n", I * 8, Val - DRIVER_BASE_UC);
+            }
+        }
+    }
 
     if (IsChkstk) {
         uint64_t StackFloorUc = STACK_BASE_UC;
@@ -464,8 +526,14 @@ bool UnicornEmu::Hooks::OnMemWriteUnmapped(uc_engine* Uc, uc_mem_type Type, uint
             Logger::Log("{CYN}WRITE UNMAPPED LOW: SEH accepted fault 0x%llx and resumed control flow{RESET}\n", Addr);
             return true;
         }
-        Logger::Log("{RED}WRITE UNMAPPED LOW: no SEH handler for 0x%llx{RESET}\n", Addr);
-        return false;
+        // Match the generic unmapped-write policy below: zero-backed page keeps
+        // the thread alive instead of aborting it on a near-null write.
+        Logger::Log("{RED}WRITE UNMAPPED LOW: no SEH handler for 0x%llx -> lazy zero page{RESET}\n", Addr);
+        {
+            std::lock_guard<std::mutex> MapGuard(UnicornEmu::UcMapLock);
+            uc_mem_map(Uc, PageAddr, 0x1000, UC_PROT_ALL);
+        }
+        return true;
     }
 
     if (PageAddr >= HYPERSPACE_BASE_UC && PageAddr < HYPERSPACE_BASE_UC + HYPERSPACE_SIZE_UC && HyperspaceBlock) {

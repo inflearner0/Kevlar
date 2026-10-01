@@ -172,6 +172,11 @@ struct PendingSseFault {
 extern PendingSseFault SseFault;
 extern bool DiagnosticHooksEnabled;
 extern bool VgkErrorOverrideEnabled;
+// --force-success / --keep-device: report DriverEntry as successful and do not
+// let the driver unlink its device, so a target that tears itself down on a
+// failed init still leaves a usable device for the bridge.
+extern bool ForceSuccessEnabled;
+extern bool KeepDeviceEnabled;
 extern bool SehDispatchEnabled;
 extern bool ModuleReadLoggingEnabled;
 extern bool IntelCpuSpoofEnabled;

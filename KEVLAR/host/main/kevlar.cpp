@@ -27,19 +27,20 @@
 #include "host/providers/provider.h"
 #include "core/registry/virtual_fs.h"
 #include "core/diagnostics/diag_center.h"
+#include "core/diagnostics/vm_lift.h"
 #include "api/io/io_device.h"
 #include "api/ke/ke_misc.h"
 #include "api/ke/ke_sync.h"
 #include "api/ke/ke_timer.h"
 #include "api/ke/ke_event.h"
+#include "host/bridge/bridge_protocol.h"
 #include "host/bridge/bridge_server.h"
-#include "host/bridge/proxy_relay.h"
 
 static bool NoPause = false;
 static bool SelfTest = false;
 static bool ServeRequested = false;
 static std::string ServeName;
-static bool ProxyRequested = false;
+static std::string SnapshotDir;
 
 // Host-level selftest for the ke_* semantics: exercises IRQL, APC queue/delivery,
 // DPC queue and timer cancel/periodic directly against the built environment.
@@ -149,6 +150,63 @@ static int RunSelfTest() {
     return Fails == 0 ? 0 : 1;
 }
 
+// Dump every mapped guest region plus register state, so the exact post-DriverEntry
+// machine state can be inspected offline (companion to the --serve live process).
+static void DumpGuestSnapshot(const std::string& Dir, uc_engine* Uc) {
+    std::error_code Ec;
+    std::filesystem::create_directories(Dir, Ec);
+
+    FILE* Man = fopen((Dir + "\\regions.txt").c_str(), "w");
+    int Idx = 0;
+    for (auto& R : UnicornEmu::MappedRegions) {
+        char FileName[128];
+        snprintf(FileName, sizeof(FileName), "ram_%03d_%016llx.bin", Idx, (unsigned long long)R.UcBase);
+        FILE* F = fopen((Dir + "\\" + FileName).c_str(), "wb");
+        uint64_t Written = 0;
+        if (F && R.Size) {
+            const size_t Chunk = 1 << 20;
+            std::vector<uint8_t> Buf(Chunk);
+            uint64_t Done = 0;
+            while (Done < R.Size) {
+                size_t N = (size_t)((R.Size - Done) > Chunk ? Chunk : (R.Size - Done));
+                if (uc_mem_read(Uc, R.UcBase + Done, Buf.data(), N) != UC_ERR_OK)
+                    break;
+                fwrite(Buf.data(), 1, N, F);
+                Done += N;
+            }
+            fclose(F);
+            Written = Done;
+        } else if (F) {
+            fclose(F);
+        }
+        if (Man)
+            fprintf(Man, "%d base=0x%016llx size=0x%llx written=0x%llx perms=0x%x name=%s file=%s\n",
+                Idx, (unsigned long long)R.UcBase, (unsigned long long)R.Size,
+                (unsigned long long)Written, R.Perms, R.Name.c_str(), FileName);
+        Idx++;
+    }
+    if (Man)
+        fclose(Man);
+
+    FILE* Regs = fopen((Dir + "\\regs.txt").c_str(), "w");
+    if (Regs) {
+        struct { const char* Name; int Id; } RegIds[] = {
+            {"RAX", UC_X86_REG_RAX}, {"RBX", UC_X86_REG_RBX}, {"RCX", UC_X86_REG_RCX}, {"RDX", UC_X86_REG_RDX},
+            {"RSI", UC_X86_REG_RSI}, {"RDI", UC_X86_REG_RDI}, {"RSP", UC_X86_REG_RSP}, {"RBP", UC_X86_REG_RBP},
+            {"R8", UC_X86_REG_R8}, {"R9", UC_X86_REG_R9}, {"R10", UC_X86_REG_R10}, {"R11", UC_X86_REG_R11},
+            {"R12", UC_X86_REG_R12}, {"R13", UC_X86_REG_R13}, {"R14", UC_X86_REG_R14}, {"R15", UC_X86_REG_R15},
+            {"RIP", UC_X86_REG_RIP}, {"RFLAGS", UC_X86_REG_EFLAGS},
+        };
+        for (auto& Reg : RegIds) {
+            uint64_t V = 0;
+            if (uc_reg_read(Uc, Reg.Id, &V) == UC_ERR_OK)
+                fprintf(Regs, "%s=0x%016llx\n", Reg.Name, (unsigned long long)V);
+        }
+        fclose(Regs);
+    }
+    Logger::Log("{GRN}Snapshot written to %s (%d regions){RESET}\n", Dir.c_str(), Idx);
+}
+
 __forceinline void InitDirs() {
     char ExePath[MAX_PATH] = { 0 };
     GetModuleFileNameA(NULL, ExePath, MAX_PATH);
@@ -222,6 +280,11 @@ int main(int Argc, char* Argv[]) {
         Logger::Log("{YEL}Per-thread logging disabled: failed to initialize thread log folder{RESET}\n");
     }
 
+    if (const char* QuietEnv = std::getenv("KEVLAR_QUIET"); QuietEnv && QuietEnv[0] == '1') {
+        Logger::SetQuiet(true);
+        Logger::Log("{CYN}Quiet logging ENABLED (no console echo, no per-thread files, buffered flushes){RESET}\n");
+    }
+
     DWORD DwMode;
     auto HOut = GetStdHandle(STD_OUTPUT_HANDLE);
     GetConsoleMode(HOut, &DwMode);
@@ -239,7 +302,11 @@ int main(int Argc, char* Argv[]) {
         Logger::Log("  --intel                 (no-op) coherent Intel CPU profile is always active{RESET}\n");
         Logger::Log("  --seed <n>              Deterministic seed for TSC jitter (default fixed){RESET}\n");
         Logger::Log("  --vgk-override          Override STATUS_ACCESS_DENIED from vgk DriverEntry{RESET}\n");
-        Logger::Log("  --devirt                Enable devirtualization testing{RESET}\n");
+        Logger::Log("  --force-success         Override DriverEntry's returned status to STATUS_SUCCESS at the ret{RESET}\n");
+        Logger::Log("  --keep-device           Do not let the driver unlink its device during teardown (for --serve){RESET}\n");
+        Logger::Log("  --snapshot[=dir]        Dump all mapped guest RAM + registers when DriverEntry completes (default: snapshot){RESET}\n");
+        Logger::Log("  --devirt[=dir]          Trace the guest bytecode VM and dump the live image (default dir: devirt){RESET}\n");
+        Logger::Log("  --dump[=dir]            Dump the live image without the VM tracer (fast; default dir: dump){RESET}\n");
         Logger::Log("  --blockprof[=secs]      Hot basic-block profiler (default dump every 30s){RESET}\n");
         Logger::Log("  --strict-exports        Unhandled exports return STATUS_NOT_IMPLEMENTED instead of 0{RESET}\n");
         Logger::Log("  --provenance            Trace branch decisions + API results for rejection paths{RESET}\n");
@@ -247,8 +314,8 @@ int main(int Argc, char* Argv[]) {
         Logger::Log("  --check <file>          Replay trace; report first divergence{RESET}\n");
         Logger::Log("  --no-pause              Skip final pause; exit ~5s after a no-thread run (automation){RESET}\n");
         Logger::Log("  --selftest              Run the ke_* semantics self-test and exit (no driver){RESET}\n");
+        Logger::Log("  --force-open            Keep a bridge session even if the driver denies IRP_MJ_CREATE{RESET}\n");
         Logger::Log("  --serve[=name]          Serve IOCTL/Read/Write over \\\\.\\pipe\\kevlar-<name> (default: driver service name){RESET}\n");
-        Logger::Log("  --proxy                 Relay real CreateFile/DeviceIoControl via kevlarproxy.sys (needs it loaded){RESET}\n");
     };
 
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
@@ -289,6 +356,15 @@ int main(int Argc, char* Argv[]) {
             if (Arg == "--vgk-override") {
                 UnicornEmu::VgkErrorOverrideEnabled = true;
                 Logger::Log("{CYN}VGK error override ENABLED (STATUS_ACCESS_DENIED -> STATUS_SUCCESS){RESET}\n");
+            } else if (Arg == "--force-success") {
+                UnicornEmu::ForceSuccessEnabled = true;
+                Logger::Log("{YEL}DriverEntry success override ENABLED (--force-success){RESET}\n");
+            } else if (Arg == "--snapshot" || Arg.rfind("--snapshot=", 0) == 0) {
+                SnapshotDir = (Arg.size() > 11) ? Arg.substr(11) : "snapshot";
+                Logger::Log("{CYN}Guest snapshot at DriverEntry completion ENABLED (output: %s){RESET}\n", SnapshotDir.c_str());
+            } else if (Arg == "--keep-device") {
+                UnicornEmu::KeepDeviceEnabled = true;
+                Logger::Log("{YEL}Device teardown suppression ENABLED (--keep-device){RESET}\n");
             } else if (Arg == "--diag") {
                 UnicornEmu::DiagnosticHooksEnabled = true;
                 Logger::Log("{YEL}Diagnostic hooks ENABLED (slow mode){RESET}\n");
@@ -320,7 +396,20 @@ int main(int Argc, char* Argv[]) {
                     UnicornEmu::BlockProfileIntervalSec);
             } else if (Arg.rfind("--devirt", 0) == 0) {
                 UnicornEmu::DevirtualizationTest = true;
-                Logger::Log("{CYN}Devirtualization Testing ENABLED{RESET}\n");
+                VmLift::Enabled = true;
+                if (Arg.size() > 8 && Arg[8] == '=')
+                    VmLift::OutDir = Arg.substr(9);
+                if (VmLift::OutDir.empty())
+                    VmLift::OutDir = "devirt";
+                Logger::Log("{CYN}VM lifting ENABLED (output: %s){RESET}\n", VmLift::OutDir.c_str());
+            } else if (Arg.rfind("--dump", 0) == 0) {
+                VmLift::Enabled = true;
+                VmLift::TracerEnabled = false;
+                if (Arg.size() > 6 && Arg[6] == '=')
+                    VmLift::OutDir = Arg.substr(7);
+                if (VmLift::OutDir.empty())
+                    VmLift::OutDir = "dump";
+                Logger::Log("{CYN}Image dumping ENABLED without VM tracer (output: %s){RESET}\n", VmLift::OutDir.c_str());
             } else if (Arg == "--strict-exports") {
                 UnicornEmu::StrictExportsEnabled = true;
                 Logger::Log("{CYN}Strict exports ENABLED (unhandled -> STATUS_NOT_IMPLEMENTED){RESET}\n");
@@ -347,6 +436,10 @@ int main(int Argc, char* Argv[]) {
                 } else {
                     Logger::Log("{RED}--check requires a file path{RESET}\n");
                 }
+            } else if (Arg == "--force-open") {
+                BridgeServer::ForceOpenEnabled = true;
+                Logger::Log("{YEL}Bridge will keep a session even when the driver denies "
+                    "IRP_MJ_CREATE (--force-open){RESET}\n");
             } else if (Arg == "--no-pause") {
                 NoPause = true;
             } else if (Arg == "--selftest") {
@@ -356,10 +449,7 @@ int main(int Argc, char* Argv[]) {
                 if (Arg.size() > 7 && Arg[7] == '=')
                     ServeName = Arg.substr(8);
                 Logger::Log("{CYN}Usermode bridge server requested%s{RESET}\n",
-                    ServeName.empty() ? " (name: driver service name)" : (" (name: " + ServeName + ")").c_str());
-            } else if (Arg == "--proxy") {
-                ProxyRequested = true;
-                Logger::Log("{CYN}Kernel proxy relay requested (kevlarproxy.sys via \\\\.\\KevlarProxyCtl){RESET}\n");
+                    ServeName.empty() ? " (default channel)" : (" (channel: " + ServeName + ")").c_str());
             } else if (Arg == "--pause")
             {
                system("pause");
@@ -431,8 +521,11 @@ int main(int Argc, char* Argv[]) {
         if (Dot != std::string::npos)
             SvcName = SvcName.substr(0, Dot);
 
+        // The bridge channel is a fixed constant shared with kevlar_hook, not the
+        // driver's filename: the hook has never seen the .sys and cannot guess it.
+        // See Bridge::kDefaultChannelA in bridge_protocol.h.
         if (ServeRequested && ServeName.empty())
-            ServeName = SvcName;
+            ServeName = Bridge::kDefaultChannelA;
 
         static std::wstring WDriverName;
         static std::wstring WRegistryBuffer;
@@ -464,6 +557,14 @@ int main(int Argc, char* Argv[]) {
 
             VirtualReg::WriteValueToFile(SvcRegPath, L"DisplayName", 1, WideSvc.c_str(), (ULONG)((WideSvc.size() + 1) * sizeof(wchar_t)));
 
+            // EAC queries Control\WMI\Restrictions\HideMachine. The real host has
+            // neither key nor value, but the driver still loads there, so seed the
+            // "machine not hidden" state explicitly (0) rather than leaving the
+            // query to fail with STATUS_OBJECT_NAME_NOT_FOUND.
+            std::wstring WmiRestrReg = VirtualFs::GetVregRoot() + L"HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Control\\WMI\\Restrictions";
+            uint32_t HideMachine = 0;
+            VirtualReg::WriteValueToFile(WmiRestrReg, L"HideMachine", 4, &HideMachine, sizeof(HideMachine));
+
             std::error_code RegEc;
             std::filesystem::create_directories(std::filesystem::path(SwRegPath), RegEc);
         }
@@ -474,6 +575,11 @@ int main(int Argc, char* Argv[]) {
         return 1;
     }
     Logger::Log("{GRN}Driver mapped. {GRY}Resolving imports.{RESET}\n");
+
+    // The VM tracer needs the image bounds, so it goes on here rather than in
+    // SetupHooks - the engine exists long before the driver is mapped.
+    if (VmLift::Enabled && VmLift::TracerEnabled)
+        VmLift::InstallTracer(UnicornEmu::PrimaryEngine, DRIVER_BASE_UC, MainModule->GetVirtualSize());
 
     // Now that the image is in memory the MSR intercept can be narrowed from the
     // whole driver range down to the pages that actually contain rdmsr/wrmsr.
@@ -602,8 +708,23 @@ int main(int Argc, char* Argv[]) {
 
     if (Result)
         Logger::Log("{GRN}DriverEntry completed successfully{RESET}\n");
+    else if (UnicornEmu::ForceSuccessEnabled) {
+        Logger::Log("{YEL}DriverEntry failed; reporting STATUS_SUCCESS (--force-success){RESET}\n");
+        Result = true;
+    }
     else
         Logger::Log("{RED}DriverEntry failed or was stopped{RESET}\n");
+
+    // The interpreter decrypts .data and builds its handler table on the way
+    // in, so the image is only worth dumping once DriverEntry has run.
+    if (VmLift::Enabled) {
+        VmLift::DumpImage("post-DriverEntry", DRIVER_BASE_UC, MainModule->GetVirtualSize());
+        if (VmLift::TracerEnabled)
+            VmLift::DumpTrace("post-DriverEntry");
+    }
+
+    if (!SnapshotDir.empty())
+        DumpGuestSnapshot(SnapshotDir, UnicornEmu::PrimaryEngine);
 
     if (ServeRequested) {
         if (BridgeServer::Start(ServeName))
@@ -611,13 +732,6 @@ int main(int Argc, char* Argv[]) {
                 ServeName.c_str(), DeviceTracker::GetCount());
         else
             Logger::Log("{RED}Usermode bridge failed to start{RESET}\n");
-    }
-
-    if (ProxyRequested) {
-        if (ProxyRelay::Start())
-            Logger::Log("{GRN}Kernel proxy relay active via \\\\.\\KevlarProxyCtl{RESET}\n");
-        else
-            Logger::Log("{RED}Kernel proxy relay failed to start (see above){RESET}\n");
     }
 
     Logger::Log("{MAG}Waiting for spawned threads (will keep alive up to 3600s for deferred work)...{RESET}\n");
@@ -629,6 +743,7 @@ int main(int Argc, char* Argv[]) {
         QueryPerformanceFrequency(&WaitFreq);
         const double MaxWaitSeconds = 3600.0;
         int LastReportSec = 0;
+        int LastLiftDumpSec = 0;
         bool EverHadThreads = false;
         int IdleCycles = 0;
 
@@ -657,6 +772,17 @@ int main(int Argc, char* Argv[]) {
             double Elapsed = (double)(Now.QuadPart - WaitStart.QuadPart) / (double)WaitFreq.QuadPart;
             int ElapsedSec = (int)Elapsed;
 
+            // Under --serve the interesting code runs *after* DriverEntry, when a
+            // client drives the device. Re-dump periodically so a run can be
+            // stopped at any point and still have current coverage, rather than
+            // only the snapshot taken before any IRP arrived.
+            if (VmLift::Enabled && ElapsedSec >= LastLiftDumpSec + 30) {
+                LastLiftDumpSec = ElapsedSec;
+                VmLift::DumpImage("periodic", DRIVER_BASE_UC, MainModule->GetVirtualSize());
+                if (VmLift::TracerEnabled)
+                    VmLift::DumpTrace("periodic");
+            }
+
             if (ElapsedSec >= LastReportSec + 10) {
                 LastReportSec = ElapsedSec;
                 Logger::Log("{GRY}[ALIVE %.0fs] threads: %d total, %d running%s{RESET}\n",
@@ -664,7 +790,7 @@ int main(int Argc, char* Argv[]) {
                     EverHadThreads ? "" : " (waiting for first thread)");
             }
 
-            if (EverHadThreads && !AnyRunning && !ServeRequested && !ProxyRequested) {
+            if (EverHadThreads && !AnyRunning && !ServeRequested) {
                 IdleCycles++;
                 if (IdleCycles > 50) {
                     Logger::Log("{CYN}All spawned threads finished after %.1fs{RESET}\n", Elapsed);
@@ -672,9 +798,9 @@ int main(int Argc, char* Argv[]) {
                 }
             }
 
-            // Under --serve/--proxy, the process exists to answer relayed requests, so
-            // idle guest threads and a driver that never spawned one are not exit conditions.
-            if (!ServeRequested && !ProxyRequested) {
+            // Under --serve, the process exists to answer relayed requests, so idle
+            // guest threads and a driver that never spawned one are not exit conditions.
+            if (!ServeRequested) {
                 double NoThreadTimeout = NoPause ? 5.0 : MaxWaitSeconds;
                 if (!EverHadThreads && Elapsed >= NoThreadTimeout) {
                     Logger::Log("{YEL}No threads spawned after %.0fs — giving up{RESET}\n", Elapsed);
@@ -686,14 +812,18 @@ int main(int Argc, char* Argv[]) {
         }
     }
 
+    if (VmLift::Enabled) {
+        VmLift::DumpImage("final", DRIVER_BASE_UC, MainModule->GetVirtualSize());
+        if (VmLift::TracerEnabled)
+            VmLift::DumpTrace("final");
+    }
+
     Logger::Log("{GRN}Done. Press any key to exit.{RESET}\n");
     if (!NoPause)
         system("pause");
 
     if (ServeRequested)
         BridgeServer::Stop();
-    if (ProxyRequested)
-        ProxyRelay::Stop();
 
     UnicornEmu::Shutdown();
     Logger::MarkThreadEnd("main");

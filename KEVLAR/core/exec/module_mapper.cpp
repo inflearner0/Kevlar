@@ -325,7 +325,11 @@ uint64_t UnicornEmu::MapSystemModule(PEFile* Module, const char* Name) {
     UnicornMem::TrackExisting(UcBase, ModHostCopy, AlignedSize, Name);
 
     uc_hook Hh;
-    uc_hook_add(PrimaryEngine, &Hh, UC_HOOK_CODE, (void*)Hooks::OnSysModExec, nullptr,
+    // Block-level, not instruction-level: the handler only needs function entry
+    // points, and a UC_HOOK_CODE over a whole module range pays a host callback
+    // per executed instruction (uncached internal addresses redo the full
+    // export/PDB resolution), which dominated multi-minute runs.
+    uc_hook_add(PrimaryEngine, &Hh, UC_HOOK_BLOCK, (void*)Hooks::OnSysModExec, nullptr,
         UcBase, UcBase + AlignedSize - 1);
 
     SysModInfo Info;

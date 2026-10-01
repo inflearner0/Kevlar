@@ -114,8 +114,16 @@ bool UnicornEmu::Hooks::OnMemReadUnmapped(uc_engine* Uc, uc_mem_type Type, uint6
             return true;
         }
 
-        Logger::Log("{RED}READ UNMAPPED LOW: no SEH handler for 0x%llx{RESET}\n", Addr);
-        return false;
+        // Same policy as every other unmapped read: keep the thread alive and
+        // back the page with zeros instead of killing emulation. Obfuscated
+        // targets probe near-null tables constantly; the driver's own SEH (when
+        // present) was already offered the fault above.
+        Logger::Log("{RED}READ UNMAPPED LOW: no SEH handler for 0x%llx -> lazy zero page{RESET}\n", Addr);
+        {
+            std::lock_guard<std::mutex> MapGuard(UnicornEmu::UcMapLock);
+            uc_mem_map(Uc, PageAddr, 0x1000, UC_PROT_ALL);
+        }
+        return true;
     }
 
     if (SehDispatch::DispatchException(Uc, STATUS_ACCESS_VIOLATION_EX, Addr)) {

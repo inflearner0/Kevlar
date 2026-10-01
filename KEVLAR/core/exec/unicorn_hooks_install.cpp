@@ -629,13 +629,16 @@ void UnicornEmu::InstallWatchpoints(uc_engine* Uc) {
         RipRingIdx = 0;
         RipRingTotal = 0;
         const char* StatusTrace = std::getenv("KEVLAR_STATUS_TRACE");
-        if (StatusTrace && StatusTrace[0] != '0') {
+        // Primary engine only: the DriverEntry return value is produced on the
+        // primary thread, and hooking every engine's instruction stream both
+        // costs several times the runtime and perturbs timing-sensitive paths.
+        if (StatusTrace && StatusTrace[0] != '0' && Uc == UnicornEmu::PrimaryEngine) {
             using RipTraceFn = void(*)(uc_engine*, uint64_t, uint32_t, void*);
             static RipTraceFn RipTracePtr = OnRipRingTrace;
             Err = uc_hook_add(Uc, &Hh, UC_HOOK_CODE, (void*)RipTracePtr, nullptr,
                 DRIVER_BASE_UC, DRIVER_BASE_UC + 0x3000000ULL - 1);
             if (Err == UC_ERR_OK) {
-                Logger::Log("{CYN}FAST MODE: Lightweight DriverEntry status trace installed (last %d instructions){RESET}\n",
+                Logger::Log("{CYN}FAST MODE: Lightweight DriverEntry status trace installed on primary engine (last %d instructions){RESET}\n",
                     RIP_RING_SIZE);
             } else {
                 Logger::Log("{RED}FAST MODE: Failed to install lightweight status trace: %s{RESET}\n", uc_strerror(Err));

@@ -141,6 +141,47 @@ NTSTATUS h_ObReferenceObjectByName(
         auto HostObj = UcPtr(Object);
         *HostObj = nullptr;
     }
+
+    // KEVLAR has no real object namespace, so any reference here used to fail.
+    // EAC's DriverEntry references \Driver\disk as a platform prerequisite;
+    // failing that turns into STATUS_OBJECT_NAME_NOT_FOUND out of DriverEntry.
+    // Hand back a synthetic DRIVER_OBJECT; everything else keeps failing --
+    // notably \Driver\kldbgdrv, which the driver uses as a debugger check.
+    if (Buf && _wcsicmp(Buf, L"\\Driver\\disk") == 0) {
+        static PVOID DiskDriverObject = nullptr;
+        if (!DiskDriverObject) {
+            const uint64_t Size = sizeof(_DRIVER_OBJECT) + 0x100;
+            uint64_t UcAddr = UnicornMem::AllocateVariable(
+                UnicornThread::GetCurrentEngine(), Size, "DiskDriverObject");
+            if (UcAddr) {
+                auto Host = (_DRIVER_OBJECT*)UnicornMem::UcToHost(UcAddr);
+                memset(Host, 0, (size_t)Size);
+                Host->Type = 3;
+                Host->Size = (SHORT)sizeof(_DRIVER_OBJECT);
+                Host->DriverStart = (PVOID)UcAddr;
+                Host->DriverSize = 0x1000;
+
+                const wchar_t* Name = L"\\Driver\\disk";
+                size_t NameBytes = (wcslen(Name) + 1) * sizeof(wchar_t);
+                size_t NameOff = (sizeof(_DRIVER_OBJECT) + 0xF) & ~0xFULL;
+                if (NameOff + NameBytes <= Size) {
+                    memcpy((uint8_t*)Host + NameOff, Name, NameBytes);
+                    Host->DriverName.Buffer = (WCHAR*)(UcAddr + NameOff);
+                    Host->DriverName.Length = (USHORT)(wcslen(Name) * sizeof(wchar_t));
+                    Host->DriverName.MaximumLength = Host->DriverName.Length + sizeof(wchar_t);
+                }
+                DiskDriverObject = (PVOID)UcAddr;
+                Logger::Log("{GRN}\t-> synthetic \\Driver\\disk at %p{RESET}\n", DiskDriverObject);
+            }
+        }
+        if (Object) {
+            auto HostObj = UcPtr(Object);
+            *HostObj = DiskDriverObject;
+            return DiskDriverObject ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+        }
+        return STATUS_SUCCESS;
+    }
+
     return 0xC0000034;
 }
 

@@ -141,14 +141,19 @@ NTSTATUS h_IoDeleteSymbolicLink(PUNICODE_STRING SymbolicLinkName) {
     auto HostSymName = UcPtr(SymbolicLinkName);
     auto HostSymBuf = UcPtr(HostSymName->Buffer);
     std::wstring SymStr(HostSymBuf, HostSymName->Length / sizeof(wchar_t));
-
+    
     Logger::Log("{CYN}\tIoDeleteSymbolicLink: %ls{RESET}\n", SymStr.c_str());
+
+    if (UnicornEmu::KeepDeviceEnabled) {
+        Logger::Log("{YEL}\tIoDeleteSymbolicLink: kept (--keep-device){RESET}\n");
+        return 0; // STATUS_SUCCESS
+    }
 
     // Mirrors h_IoCreateSymbolicLink: symlinks live only in DeviceTracker's emulated
     // state, so deletion must stay there too. This used to call the real
     // ZwOpenSymbolicLinkObject/ZwMakeTemporaryObject against the host Object Manager,
     // which meant a guest driver deleting a symlink name that happens to exist on the
-    // host would make the host's real object temporary (kevlar_proxy/README.md SS8).
+    // host would make the host's real object temporary (docs/bridge.md SS6).
     {
         std::lock_guard<std::mutex> Guard(DeviceTracker::DeviceLock);
         for (auto& Dev : DeviceTracker::Devices) {
