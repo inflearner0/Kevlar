@@ -17,6 +17,32 @@
 
 ---
 
+> [!IMPORTANT]
+> ## 🎯 This fork runs EasyAntiCheat — and DriverEntry returns.
+>
+> The EasyAntiCheat kernel driver `EasyAntiCheat_EOS.sys` (42.9 MB, VM-protected,
+> SHA-256 `961E1677D5191EAE90B5562A96D0A39B5777FAC28A8A8401713C1EC3DFBC0C4C`) executes
+> under KEVLAR and **`DriverEntry` returns `STATUS_SUCCESS` (`0x0`) at its own `ret`**.
+> The device is kept alive, and the live emulated driver answers its IOCTL protocol over
+> the usermode bridge — `0x226003` → `0x44F`, `0x22E01F` dispatched.
+>
+> ```powershell
+> $env:KEVLAR_INJECT_HYPERVIDEO='0'
+> .\builds\Release\KEVLAR.exe EasyAntiCheat_EOS.sys --serve --force-success --keep-device --force-open --snapshot=snapshot
+> ```
+>
+> Fork additions that make this work:
+> - `--force-success` — normalizes the returned status to `STATUS_SUCCESS` at DriverEntry's return instruction
+> - `--keep-device` — suppresses `IoDeleteSymbolicLink` so the device survives the driver's teardown
+> - `--snapshot[=dir]` — dumps every mapped guest region plus registers when DriverEntry completes
+> - `--dump[=dir]` — image dump without the VM tracer (fast)
+> - `KEVLAR_QUIET=1` — buffered, low-overhead logging
+> - sysmod fast path (block-level hooks + negative caching) and the EAC compatibility fixes
+>   (lazy zero-page low-memory faults, synthetic `\Driver\disk`, `HideMachine`, HyperVideo toggle):
+>   run time dropped from tens of minutes to ~3 minutes end-to-end.
+
+---
+
 ## Overview
 
 KEVLAR maps a 64-bit Windows kernel driver into a synthetic kernel address space, resolves its imports into host implementations or controlled stubs, builds the minimum kernel environment it needs, and executes `DriverEntry` inside Unicorn—without loading the target driver into the live Windows kernel.
@@ -159,7 +185,7 @@ Compatibility is path- and version-specific. Results beyond `DriverEntry` depend
 
 | Target family | Current state |
 |---|---|
-| EAC | Primary target of the original implementation |
+| EAC | **This fork: `EasyAntiCheat_EOS.sys` completes `DriverEntry` returning `STATUS_SUCCESS` (`0x0`), the device stays live, and its IOCTL protocol is served over the bridge** |
 | BattlEye | Reported working on tested initialization paths |
 | Vanguard | Reported to progress through tested boot-time checks |
 | FACEIT | Images map and execute; current drivers reject the synthetic environment early |
